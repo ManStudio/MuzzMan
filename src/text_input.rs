@@ -1,23 +1,15 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    ops::Range,
-    path::{self, PathBuf},
-    rc::Rc,
-    sync::Arc,
-};
+use std::ops::Range;
 
 use blobsman_graphics::{
-    gpui::{self, Hsla, Interactivity, ScrollAnchor, ScrollHandle},
-    tokio, unicode_segmentation,
+    gpui::{self, Hsla, ScrollHandle},
+    unicode_segmentation,
 };
 use gpui::{
-    App, AppContext, Bounds, ClipboardItem, CursorStyle, Edges, ElementId, ElementInputHandler,
-    Empty, Entity, EntityId, EntityInputHandler, ExternalPaths, FileDropEvent, FocusHandle,
-    Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, ShapedLine, SharedString, Style,
-    Styled, TextRun, UTF16Selection, UnderlineStyle, Window, WindowOptions, actions,
-    colors::DefaultColors, div, fill, hsla, point, prelude::*, px, relative, rgb, rgba, size,
-    white,
+    App, Bounds, ClipboardItem, CursorStyle, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render,
+    ShapedLine, SharedString, Style, Styled, TextRun, UTF16Selection, UnderlineStyle, Window,
+    actions, div, fill, point, prelude::*, px, rgba, size,
 };
 
 use unicode_segmentation::UnicodeSegmentation;
@@ -251,16 +243,6 @@ impl TextInput {
             .find_map(|(idx, _)| (idx > offset).then_some(idx))
             .unwrap_or(self.content.len())
     }
-
-    fn reset(&mut self) {
-        self.content = "".into();
-        self.selected_range = 0..0;
-        self.selection_reversed = false;
-        self.marked_range = None;
-        self.last_layout = None;
-        self.last_bounds = None;
-        self.is_selecting = false;
-    }
 }
 
 impl EntityInputHandler for TextInput {
@@ -306,7 +288,7 @@ impl EntityInputHandler for TextInput {
         &mut self,
         range_utf16: Option<Range<usize>>,
         new_text: &str,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let range = range_utf16
