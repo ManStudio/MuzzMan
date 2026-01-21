@@ -29,7 +29,7 @@ actions!(
         Paste,
         Cut,
         Copy,
-        Quit,
+        Submit,
     ]
 );
 
@@ -46,6 +46,7 @@ pub struct TextInput {
     pub last_layout: Option<ShapedLine>,
     pub last_bounds: Option<Bounds<Pixels>>,
     pub is_selecting: bool,
+    pub on_submit: Box<dyn Fn(&SharedString, &mut Window, &mut App) + 'static>,
 }
 
 impl TextInput {
@@ -145,6 +146,9 @@ impl TextInput {
             ));
             self.replace_text_in_range(None, "", window, cx)
         }
+    }
+    fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
+        (self.on_submit)(&self.content, window, cx);
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -545,8 +549,15 @@ impl Element for TextElement {
             window.paint_quad(selection)
         }
         let line = prepaint.line.take().unwrap();
-        line.paint(bounds.origin, window.line_height(), window, cx)
-            .unwrap();
+        line.paint(
+            bounds.origin,
+            window.line_height(),
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        )
+        .unwrap();
 
         if focus_handle.is_focused(window)
             && let Some(cursor) = prepaint.cursor.take()
@@ -581,6 +592,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::submit))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
