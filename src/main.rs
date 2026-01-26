@@ -3,13 +3,14 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::atomic::AtomicU64,
+    time::{Duration, Instant},
 };
 
 use blobsman_graphics::{
     futures_util::StreamExt,
     gpui::{
-        self, AssetSource, ClipboardItem, Div, EventEmitter, PathPromptOptions, ScrollHandle,
-        WindowDecorations, anchored, deferred, svg,
+        self, AssetSource, ClipboardItem, Div, EventEmitter, FutureExt, PathPromptOptions,
+        ScrollHandle, TitlebarOptions, WindowDecorations, anchored, deferred, svg,
     },
     gpui_tokio,
     iroh::{self, EndpointAddr, PublicKey},
@@ -47,6 +48,8 @@ const SVG_CLOSE: &str = include_str!("../assets/close_24dp_E3E3E3_FILL0_wght400_
 const SVG_SHARE: &str = include_str!("../assets/share_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg");
 const SVG_DOWNLOAD: &str =
     include_str!("../assets/download_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg");
+const SVG_UPLOAD: &str =
+    include_str!("../assets/upload_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg");
 
 pub struct Assets {}
 
@@ -60,6 +63,8 @@ impl AssetSource for Assets {
             "close" => Ok(Some(std::borrow::Cow::Borrowed(SVG_CLOSE.as_bytes()))),
             "share" => Ok(Some(std::borrow::Cow::Borrowed(SVG_SHARE.as_bytes()))),
             "download" => Ok(Some(std::borrow::Cow::Borrowed(SVG_DOWNLOAD.as_bytes()))),
+            // TODO: I need a better export icon
+            "export" => Ok(Some(std::borrow::Cow::Borrowed(SVG_UPLOAD.as_bytes()))),
             _ => Ok(None),
         }
     }
@@ -158,9 +163,17 @@ pub enum Entry {
     Collection(Entity<EntryCollection>),
 }
 
-struct DownloadStatus {
+struct DownloadPeerStatus {
     total: u64,
-    speed: usize,
+    speed: u64,
+    second_buffer: u64,
+    last_second: Instant,
+}
+
+#[derive(Default)]
+struct DownloadStatus {
+    peers: HashMap<PublicKey, DownloadPeerStatus>,
+    active: Option<PublicKey>,
 }
 
 struct UploadStatus {
@@ -168,7 +181,7 @@ struct UploadStatus {
     speed: usize,
 }
 
-pub enum EntryStatus {
+enum EntryStatus {
     Importing {
         bytes: u64,
     },
@@ -177,9 +190,11 @@ pub enum EntryStatus {
     },
     Active {
         hash: Hash,
-        downloading: HashMap<PublicKey, DownloadStatus>,
+        downloading: DownloadStatus,
         uploading: HashMap<PublicKey, UploadStatus>,
-        total: u64,
+        exporting: HashMap<SharedString, u64>,
+        current_size: u64,
+        total_size: u64,
     },
 }
 
@@ -219,7 +234,7 @@ pub struct EntryCollection {
     context_menu_offset_x: Pixels,
 }
 
-impl EventEmitter<Message> for EntryCollection {}
+impl EventEmitter<Event> for EntryCollection {}
 
 impl Render for EntryCollection {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -278,7 +293,7 @@ impl Render for EntryCollection {
                                     .max_h(px(scale(14.)))
                                     .id("share")
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        cx.emit(Message::ShareCollection {
+                                        cx.emit(Event::ShareCollection {
                                             entry_id: this.id,
                                             me: false,
                                         });
@@ -367,13 +382,14 @@ impl Render for EntryCollection {
                                         div()
                                             .bg(rgb(0x212121))
                                             .mt(px(scale(1.0)))
-                                            .child("Copy Ticket")
-                                            .id("copy-ticket")
+                                            .child("Share")
+                                            .id("share")
                                             .hover(|s| s.bg(rgb(0x2f2f2f)))
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                                    this.hash.to_hex(),
-                                                ));
+                                                cx.emit(Event::ShareCollection {
+                                                    entry_id: this.id,
+                                                    me: false,
+                                                });
                                             })),
                                     )
                                     .child(
@@ -382,7 +398,10 @@ impl Render for EntryCollection {
                                             .mt(px(scale(1.0)))
                                             .child("Export")
                                             .id("export")
-                                            .hover(|s| s.bg(rgb(0x2f2f2f))),
+                                            .hover(|s| s.bg(rgb(0x2f2f2f)))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                cx.emit(Event::Export { entry_id: this.id })
+                                            })),
                                     )
                                     .child(
                                         div()
@@ -404,7 +423,7 @@ impl Render for EntryCollection {
     }
 }
 
-impl EventEmitter<Message> for EntryBlob {}
+impl EventEmitter<Event> for EntryBlob {}
 
 impl Render for EntryBlob {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -473,32 +492,41 @@ impl Render for EntryBlob {
                                     .max_h(px(scale(14.)))
                                     .id("download")
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        cx.emit(Message::StartDownload { entry_id: this.id });
+                                        cx.emit(Event::StartDownload { entry_id: this.id });
                                     })),
                             ),
                             EntryStatus::Active {
-                                downloading, total, ..
+                                total_size,
+                                current_size,
+                                ..
                             } => this
-                                .when(
-                                    (downloading.iter().next().map(|e| e.1.total))
-                                        .unwrap_or(*total)
-                                        != *total,
-                                    |this| {
-                                        this.child(
-                                            div()
-                                                .text_color(rgb(0x00ff00))
-                                                .text_size(px(scale(8.)))
-                                                .child(format!(
-                                                    "{:0.2}%",
-                                                    ((downloading.iter().next().map(|e| e.1.total))
-                                                        .unwrap_or(*total)
-                                                        as f32
-                                                        / (*total as f32))
-                                                        * 100.
-                                                )),
-                                        )
-                                    },
-                                )
+                                .when(total_size != current_size, |this| {
+                                    this.child(
+                                        div()
+                                            .text_color(rgb(0x00ff00))
+                                            .text_size(px(scale(8.)))
+                                            .child(format!(
+                                                "{:0.2}%",
+                                                (*current_size as f32 / *total_size as f32) * 100.
+                                            )),
+                                    )
+                                })
+                                .when(total_size == current_size, |this| {
+                                    this.child(
+                                        svg()
+                                            .flex()
+                                            .text_color(rgb(0x0000ff))
+                                            .path(SharedString::new_static("export"))
+                                            .min_w(px(scale(14.)))
+                                            .min_h(px(scale(14.)))
+                                            .max_w(px(scale(14.)))
+                                            .max_h(px(scale(14.)))
+                                            .id("export")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                cx.emit(Event::Export { entry_id: this.id });
+                                            })),
+                                    )
+                                })
                                 .when(
                                     self.status.hash().unwrap_or(Hash::EMPTY) != Hash::EMPTY,
                                     |this| {
@@ -513,7 +541,7 @@ impl Render for EntryBlob {
                                                 .max_h(px(scale(14.)))
                                                 .id("share")
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    cx.emit(Message::Share {
+                                                    cx.emit(Event::Share {
                                                         entry_id: this.id,
                                                         me: false,
                                                     });
@@ -540,13 +568,53 @@ impl Render for EntryBlob {
         ); // header
 
         if self.expanded {
-            let content = div()
+            let mut content = div()
                 .flex()
                 .flex_col()
                 .flex_grow()
                 .bg(rgb(0x212529))
                 .pb(px(scale(4.)))
                 .pt(px(scale(4.)));
+
+            if let EntryStatus::Active {
+                downloading,
+                exporting,
+                total_size,
+                ..
+            } = &self.status
+            {
+                if let Some(id) = downloading.active
+                    && let Some(stats) = downloading.peers.get(&id)
+                {
+                    content = content.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .text_size(px(scale(8.)))
+                            .child(format!("Donwloading from: {id}"))
+                            .child(div().flex().flex_grow())
+                            .child(
+                                div()
+                                    .text_color(rgb(0x00ff00))
+                                    .child(format!("Speed: {}s", format_bytes(stats.speed))),
+                            ),
+                    );
+                }
+
+                for (path, size) in exporting.iter() {
+                    content = content.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .child(div().child(path.clone()))
+                            .child(div().flex().flex_grow())
+                            .child(div().child(format!(
+                                "{:0.2}%",
+                                (*size as f32 / *total_size as f32) * 100.
+                            ))),
+                    );
+                }
+            }
 
             let outer_body = div().flex().flex_col().pl(px(scale(9.0))).child(
                 div().flex().bg(rgb(0x495057)).flex_col().child(
@@ -593,15 +661,14 @@ impl Render for EntryBlob {
                                             div()
                                                 .bg(rgb(0x212121))
                                                 .mt(px(scale(1.0)))
-                                                .child("Copy Hash and format")
-                                                .id("copy-hash-and-format")
+                                                .child("Share")
+                                                .id("share")
                                                 .hover(|s| s.bg(rgb(0x2f2f2f)))
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    cx.write_to_clipboard(
-                                                        ClipboardItem::new_string(
-                                                            this.status.hash().unwrap().to_string(),
-                                                        ),
-                                                    );
+                                                    cx.emit(Event::Share {
+                                                        entry_id: this.id,
+                                                        me: false,
+                                                    });
                                                 })),
                                         )
                                     })
@@ -611,7 +678,10 @@ impl Render for EntryBlob {
                                             .mt(px(scale(1.0)))
                                             .child("Export")
                                             .id("export")
-                                            .hover(|s| s.bg(rgb(0x2f2f2f))),
+                                            .hover(|s| s.bg(rgb(0x2f2f2f)))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                cx.emit(Event::Export { entry_id: this.id })
+                                            })),
                                     )
                                     .child(
                                         div()
@@ -667,6 +737,7 @@ impl Render for Tree {
 pub struct Settings {
     auto_collection: bool,
     auto_download: bool,
+    auto_expand: bool,
 }
 
 #[derive(Debug)]
@@ -693,49 +764,32 @@ pub enum Message {
         name: String,
         provider: EndpointAddr,
     },
-    StartDownload {
-        entry_id: u64,
-    },
     DownloadProgress {
         entry_id: u64,
         progress: DownloadProgressItem,
         max_size: u64,
     },
-    ShareCollection {
-        entry_id: u64,
-        me: bool,
-    },
-    Share {
-        entry_id: u64,
-        me: bool,
-    },
     SetCollectionHash {
         entry_id: u64,
         hash: Hash,
     },
+    Event(Event),
+    ExportProgress {
+        entry_id: u64,
+        path: SharedString,
+        size: u64,
+    },
 }
 
-// This should me a Event
-impl Clone for Message {
-    fn clone(&self) -> Self {
-        match self {
-            Self::StartDownload { entry_id } => Self::StartDownload {
-                entry_id: entry_id.clone(),
-            },
-            Self::ShareCollection { entry_id, me } => Self::ShareCollection {
-                entry_id: *entry_id,
-                me: *me,
-            },
-            Self::Share { entry_id, me } => Self::Share {
-                entry_id: *entry_id,
-                me: *me,
-            },
-            _ => todo!(),
-        }
-    }
+#[derive(Debug, Clone)]
+pub enum Event {
+    ShareCollection { entry_id: u64, me: bool },
+    Share { entry_id: u64, me: bool },
+    StartDownload { entry_id: u64 },
+    Export { entry_id: u64 },
 }
 
-pub struct BlobsManApp {
+pub struct MuzzManApp {
     focus_handle: FocusHandle,
     text_input: Entity<TextInput>,
     tree: Entity<Tree>,
@@ -756,8 +810,8 @@ struct CollectionMeta {
     names: Vec<String>,
 }
 
-impl BlobsManApp {
-    fn handle_url(&mut self, url: &str, cx: &mut Context<'_, BlobsManApp>) {
+impl MuzzManApp {
+    fn handle_url(&mut self, url: &str, cx: &mut Context<'_, MuzzManApp>) {
         let Some((protocol, url)) = url.split_once(':') else {
             eprintln!("Invalid url");
             return;
@@ -824,7 +878,10 @@ impl BlobsManApp {
                                                 &new_buffer
                                             ))
                                             .unwrap();
-                                        assert_eq!(&collection_meta.header, b"CollectionV0.");
+                                        if &collection_meta.header != b"CollectionV0." {
+                                            eprintln!("Is not a valid collection");
+                                            return;
+                                        }
 
                                         let collection_id = next_id();
 
@@ -867,7 +924,7 @@ impl BlobsManApp {
         }
     }
 
-    fn update(&mut self, message: Message, cx: &mut Context<'_, BlobsManApp>) {
+    fn update(&mut self, message: Message, cx: &mut Context<'_, MuzzManApp>) {
         println!("Received: {message:?}");
 
         match message {
@@ -913,7 +970,7 @@ impl BlobsManApp {
                         match entry {
                             Entry::Blob(entry) => {
                                 entry.update(cx, |entry, cx| {
-                                    let total =
+                                    let bytes =
                                         if let EntryStatus::Importing { bytes } = entry.status {
                                             bytes
                                         } else {
@@ -922,9 +979,11 @@ impl BlobsManApp {
 
                                     entry.status = EntryStatus::Active {
                                         hash: temp_tag.hash(),
-                                        downloading: HashMap::default(),
+                                        downloading: Default::default(),
                                         uploading: HashMap::default(),
-                                        total,
+                                        total_size: bytes,
+                                        current_size: bytes,
+                                        exporting: HashMap::default(),
                                     };
                                     cx.notify();
                                 });
@@ -944,7 +1003,8 @@ impl BlobsManApp {
                             let Entry::Collection(collection_entity) =
                                 tree.all_entries.get(&collection_id).unwrap()
                             else {
-                                todo!()
+                                eprintln!("Some how was not a collection");
+                                return;
                             };
                             let collection = collection_entity.read(cx);
 
@@ -963,7 +1023,6 @@ impl BlobsManApp {
                             let sender = self.sender.clone();
 
                             gpui_tokio::Tokio::spawn(cx, async move {
-                                dbg!(&collection);
                                 let mut temp_tag = collection.store(&blobs).await.unwrap();
                                 temp_tag.leak();
                                 sender
@@ -994,8 +1053,8 @@ impl BlobsManApp {
 
                 let entry = Entry::Collection(cx.new(|cx| {
                     let sender = self.sender.clone();
-                    cx.subscribe_self::<Message>(move |_, message, _| {
-                        sender.try_send(message.clone()).unwrap();
+                    cx.subscribe_self::<Event>(move |_, event, _| {
+                        sender.try_send(Message::Event(event.clone())).unwrap();
                     })
                     .detach();
                     EntryCollection {
@@ -1031,11 +1090,9 @@ impl BlobsManApp {
                     .or_insert((hash, Vec::default(), 0));
                 entry.1.push(provider);
 
-                let entity = cx.entity();
-
                 if self.settings.auto_download {
                     self.sender
-                        .try_send(Message::StartDownload { entry_id })
+                        .try_send(Message::Event(Event::StartDownload { entry_id }))
                         .unwrap();
                 }
 
@@ -1050,8 +1107,8 @@ impl BlobsManApp {
                         collection.update(cx, |collection, cx| {
                             let entry = cx.new(|cx| {
                                 let sender = self.sender.clone();
-                                cx.subscribe_self::<Message>(move |_, message, _| {
-                                    sender.try_send(message.clone()).unwrap();
+                                cx.subscribe_self::<Event>(move |_, event, _| {
+                                    sender.try_send(Message::Event(event.clone())).unwrap();
                                 })
                                 .detach();
                                 EntryBlob {
@@ -1074,8 +1131,8 @@ impl BlobsManApp {
                     } else {
                         let entry = Entry::Blob(cx.new(|cx| {
                             let sender = self.sender.clone();
-                            cx.subscribe_self::<Message>(move |_, message, _| {
-                                sender.try_send(message.clone()).unwrap();
+                            cx.subscribe_self::<Event>(move |_, event, _| {
+                                sender.try_send(Message::Event(event.clone())).unwrap();
                             })
                             .detach();
 
@@ -1099,7 +1156,7 @@ impl BlobsManApp {
                     cx.notify();
                 });
             }
-            Message::StartDownload { entry_id } => {
+            Message::Event(Event::StartDownload { entry_id }) => {
                 let Some(info) = self.blob_info.get(&entry_id) else {
                     eprintln!("Cannot get info for: {entry_id}");
                     return;
@@ -1114,18 +1171,22 @@ impl BlobsManApp {
                 self.tree.update(cx, |tree, cx| {
                     let entry = tree.all_entries.get(&entry_id).unwrap();
 
-                    match entry {
-                        Entry::Blob(entity) => {
-                            entity.update(cx, |entry, cx| {
-                                entry.status = EntryStatus::Active {
-                                    hash,
-                                    downloading: HashMap::default(),
-                                    uploading: HashMap::default(),
-                                    total: 0,
-                                };
-                            });
-                        }
-                        _ => {}
+                    if let Entry::Blob(entity) = entry {
+                        entity.update(cx, |entry, cx| {
+                            entry.status = EntryStatus::Active {
+                                hash,
+                                downloading: Default::default(),
+                                uploading: HashMap::default(),
+                                total_size: u64::MAX,
+                                current_size: 0,
+                                exporting: HashMap::default(),
+                            };
+
+                            if self.settings.auto_expand {
+                                entry.expanded = true;
+                                cx.notify();
+                            }
+                        });
                     }
                 });
 
@@ -1162,7 +1223,7 @@ impl BlobsManApp {
                     let mut stream = progress.stream().await.unwrap();
 
                     while let Some(progress) = stream.next().await {
-                        sender
+                        _ = sender
                             .send(Message::DownloadProgress {
                                 entry_id,
                                 progress,
@@ -1183,21 +1244,16 @@ impl BlobsManApp {
                         Entry::Blob(entry) => {
                             entry.update(cx, |entry, cx| {
                                 let EntryBlob {
-                                    id,
                                     status:
                                         EntryStatus::Active {
                                             hash,
                                             downloading,
-                                            uploading,
-                                            total,
+                                            total_size,
+                                            current_size,
+                                            ..
                                         },
-                                    name,
                                     expanded,
-                                    show_context_menu,
-                                    track_bounds,
-                                    entry_header_hovered,
-                                    context_menu_hovered,
-                                    context_menu_offset_x,
+                                    ..
                                 } = entry
                                 else {
                                     return;
@@ -1208,28 +1264,49 @@ impl BlobsManApp {
                                     DownloadProgressItem::TryProvider { id, request } => {
                                         assert_eq!(request.hash, *hash);
 
-                                        downloading
-                                            .entry(id)
-                                            .or_insert(DownloadStatus { total: 0, speed: 0 });
-                                    }
-                                    DownloadProgressItem::ProviderFailed { id, request } => {}
-                                    DownloadProgressItem::PartComplete { request } => {}
-                                    DownloadProgressItem::Progress(bytes) => {
-                                        *total = max_size;
+                                        downloading.peers.entry(id).or_insert(DownloadPeerStatus {
+                                            total: 0,
+                                            speed: 0,
+                                            second_buffer: 0,
+                                            last_second: Instant::now(),
+                                        });
 
-                                        let (_, stats) = downloading.iter_mut().next().unwrap();
-                                        stats.total = bytes;
-                                        cx.notify();
+                                        downloading.active = Some(id);
+                                    }
+                                    DownloadProgressItem::ProviderFailed { .. } => {}
+                                    DownloadProgressItem::PartComplete { .. } => {
+                                        downloading.active = None;
+                                    }
+                                    DownloadProgressItem::Progress(bytes) => {
+                                        *current_size = bytes;
+                                        *total_size = max_size;
+
+                                        if let Some(id) = downloading.active {
+                                            let stats = downloading.peers.get_mut(&id).unwrap();
+                                            stats.second_buffer += bytes - stats.total;
+                                            stats.total = bytes;
+
+                                            if stats.last_second.elapsed() >= Duration::from_secs(1)
+                                            {
+                                                stats.speed = stats.second_buffer;
+                                                stats.second_buffer = 0;
+                                                stats.last_second = Instant::now();
+                                            }
+                                        }
+
+                                        if *expanded {
+                                            cx.notify();
+                                        }
                                     }
                                     DownloadProgressItem::DownloadError => {}
                                 }
                             });
                         }
-                        Entry::Collection(entity) => {}
+                        Entry::Collection(_) => {}
                     }
                 });
             }
-            Message::ShareCollection { entry_id, me } => {
+            Message::Event(Event::ShareCollection { entry_id, me }) => {
                 if me {
                     let Some(info) = self.blob_info.get(&entry_id) else {
                         unreachable!()
@@ -1241,7 +1318,7 @@ impl BlobsManApp {
                         iroh_blobs::BlobFormat::HashSeq,
                     );
 
-                    cx.write_to_clipboard(ClipboardItem::new_string(format!("sendme:{ticket}")));
+                    write_to_clipboard(cx, ClipboardItem::new_string(format!("sendme:{ticket}")));
                 } else {
                     let Some(info) = self.blob_info.get(&entry_id) else {
                         unreachable!()
@@ -1256,10 +1333,10 @@ impl BlobsManApp {
                         iroh_blobs::BlobFormat::HashSeq,
                     );
 
-                    cx.write_to_clipboard(ClipboardItem::new_string(format!("sendme:{ticket}")));
+                    write_to_clipboard(cx, ClipboardItem::new_string(format!("sendme:{ticket}")));
                 }
             }
-            Message::Share { entry_id, me } => {
+            Message::Event(Event::Share { entry_id, me }) => {
                 if me {
                     let Some(info) = self.blob_info.get(&entry_id) else {
                         unreachable!()
@@ -1271,7 +1348,10 @@ impl BlobsManApp {
                         iroh_blobs::BlobFormat::HashSeq,
                     );
 
-                    cx.write_to_clipboard(ClipboardItem::new_string(format!("iroh_blob:{ticket}")));
+                    write_to_clipboard(
+                        cx,
+                        ClipboardItem::new_string(format!("iroh_blob:{ticket}")),
+                    );
                 } else {
                     let Some(info) = self.blob_info.get(&entry_id) else {
                         unreachable!()
@@ -1286,7 +1366,10 @@ impl BlobsManApp {
                         iroh_blobs::BlobFormat::HashSeq,
                     );
 
-                    cx.write_to_clipboard(ClipboardItem::new_string(format!("iroh_blob:{ticket}")));
+                    write_to_clipboard(
+                        cx,
+                        ClipboardItem::new_string(format!("iroh_blob:{ticket}")),
+                    );
                 }
             }
             Message::SetCollectionHash { entry_id, hash } => {
@@ -1305,15 +1388,176 @@ impl BlobsManApp {
                     });
                 })
             }
+            Message::Event(Event::Export { entry_id }) => {
+                let tree = self.tree.read(cx);
+
+                let Some(entity) = tree.all_entries.get(&entry_id).cloned() else {
+                    return;
+                };
+
+                match entity {
+                    Entry::Blob(entity) => {
+                        if self.settings.auto_expand {
+                            entity.update(cx, |blob, cx| {
+                                blob.expanded = true;
+                                cx.notify();
+                            });
+                        }
+
+                        let blob = entity.read(cx);
+
+                        let res = cx.prompt_for_new_path(Path::new(""), Some(&blob.name));
+                        let Some(hash) = blob.status.hash() else {
+                            return;
+                        };
+                        let blobs = self.blobs.clone();
+                        let sender = self.sender.clone();
+                        let entry_id = blob.id;
+                        let total_size = match blob.status {
+                            EntryStatus::Active { total_size, .. } => total_size,
+                            _ => return,
+                        };
+                        cx.spawn(async move |_, cx| {
+                            let Ok(Ok(Some(path))) = res.await else {
+                                return;
+                            };
+
+                            println!("Exporting: {hash} to {path:?}");
+                            _ = gpui_tokio::Tokio::spawn(cx, async move {
+                                let mut stream = blobs.export(hash, &path).stream().await;
+                                let path = SharedString::from(path.to_string_lossy().to_string());
+
+                                while let Some(progress) = stream.next().await {
+                                    match progress{
+                                        iroh_blobs::api::blobs::ExportProgressItem::Size(_) => {},
+                                        iroh_blobs::api::blobs::ExportProgressItem::CopyProgress(size) => {
+                                            sender.send(Message::ExportProgress { entry_id, path: path.clone(), size }).await;
+                                        },
+                                        iroh_blobs::api::blobs::ExportProgressItem::Done => {
+                                            sender.send(Message::ExportProgress { entry_id, path: path.clone(), size: total_size }).await;
+                                        },
+                                        iroh_blobs::api::blobs::ExportProgressItem::Error(error) => {
+                                            println!("Export error: {error}");
+                                        },
+                                    }
+                                }
+
+                                println!("Exported: {hash} to {path:?}");
+                            })
+                            .await;
+                        })
+                        .detach();
+                    }
+                    Entry::Collection(entity) => {
+                        if self.settings.auto_expand {
+                            entity.update(cx, |collection, cx| {
+                                collection.expanded = true;
+                                cx.notify();
+                            });
+                        }
+
+                        let collection = entity.read(cx);
+
+                        let res = cx.prompt_for_paths(PathPromptOptions {
+                            files: false,
+                            directories: true,
+                            multiple: false,
+                            prompt: Some("Export To".into()),
+                        });
+
+                        let mut to_save = Vec::new();
+
+                        for child in collection.entries.iter() {
+                            let entry = child.read(cx);
+
+                            let Some(hash) = entry.status.hash() else {
+                                continue;
+                            };
+
+                            let path = entry.name.replace('\\', "/");
+
+                            to_save.push((hash, path));
+                        }
+
+                        let blobs = self.blobs.clone();
+
+                        cx.spawn(async move |_, cx| {
+                            let Ok(Ok(Some(path))) = res.await else {
+                                return;
+                            };
+
+                            let Some(root_path) = path.get(0) else {
+                                return;
+                            };
+
+                            for to_save in to_save.iter() {
+                                let mut path = root_path.clone();
+                                let path_str = to_save.1.trim();
+                                let path_str = path_str.strip_suffix("/").unwrap_or(path_str);
+
+                                for component in path_str.split('/') {
+                                    path = path.join(component);
+                                }
+
+                                let blobs = blobs.clone();
+                                let hash = to_save.0;
+
+                                println!("{hash}: {path:?}");
+
+                                _ = gpui_tokio::Tokio::spawn(cx, async move {
+                                    match blobs.export(hash, &path).await {
+                                        Ok(size) => {
+                                            println!(
+                                                "Exported {hash} to {path:?}, with size: {}",
+                                                format_bytes(size)
+                                            );
+                                        }
+                                        Err(err) => {
+                                            println!(
+                                                "Cannot export: {hash} to {path:?}, because: {err}"
+                                            );
+                                        }
+                                    }
+                                })
+                                .detach();
+                            }
+                        })
+                        .detach();
+                    }
+                }
+            }
+            Message::ExportProgress {
+                entry_id,
+                path,
+                size,
+            } => {
+                let tree = self.tree.read(cx);
+                let Some(Entry::Blob(blob)) = tree.all_entries.get(&entry_id).cloned() else {
+                    return;
+                };
+
+                blob.update(cx, |blob, cx| {
+                    let EntryStatus::Active { exporting, .. } = &mut blob.status else {
+                        return;
+                    };
+
+                    let progress = exporting.entry(path).or_default();
+                    *progress = size;
+
+                    if blob.expanded {
+                        cx.notify();
+                    }
+                });
+            }
         }
     }
 
-    fn add_files(&mut self, files: Vec<PathBuf>, cx: &mut Context<'_, BlobsManApp>) {
+    fn add_files(&mut self, files: Vec<PathBuf>, cx: &mut Context<'_, MuzzManApp>) {
         let auto_collection = self.settings.auto_collection;
 
         self.tree.update(cx, |tree, cx| {
             'auto_collection: {
-                if !auto_collection || files.len() < 2 {
+                if !auto_collection {
                     break 'auto_collection;
                 }
                 let mut min = files[0].components().count();
@@ -1329,7 +1573,7 @@ impl BlobsManApp {
                 min -= 1;
 
                 let mut common_components = None;
-                for i in 0..min {
+                for i in 1..min {
                     let i = min - i;
                     common_components = Some(i);
                     let common = files[0].components().nth(i).unwrap();
@@ -1399,8 +1643,8 @@ impl BlobsManApp {
 
                     let entry = cx.new(|cx| {
                         let sender = self.sender.clone();
-                        cx.subscribe_self::<Message>(move |_, message: _, _| {
-                            sender.try_send(message.clone()).unwrap()
+                        cx.subscribe_self::<Event>(move |_, event, _| {
+                            sender.try_send(Message::Event(event.clone())).unwrap()
                         })
                         .detach();
                         EntryBlob {
@@ -1433,8 +1677,8 @@ impl BlobsManApp {
 
                 let collection = Entry::Collection(cx.new(|cx| {
                     let sender = self.sender.clone();
-                    cx.subscribe_self::<Message>(move |_, message: _, _| {
-                        sender.try_send(message.clone()).unwrap()
+                    cx.subscribe_self::<Event>(move |_, event, _| {
+                        sender.try_send(Message::Event(event.clone())).unwrap()
                     })
                     .detach();
 
@@ -1496,8 +1740,8 @@ impl BlobsManApp {
 
                 let entry = Entry::Blob(cx.new(|cx| {
                     let sender = self.sender.clone();
-                    cx.subscribe_self::<Message>(move |_, message: _, _| {
-                        sender.try_send(message.clone()).unwrap()
+                    cx.subscribe_self::<Event>(move |_, event, _| {
+                        sender.try_send(Message::Event(event.clone())).unwrap()
                     })
                     .detach();
                     EntryBlob {
@@ -1522,10 +1766,32 @@ impl BlobsManApp {
     }
 }
 
-impl Render for BlobsManApp {
-    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+/// On KDE Plasma 6.5.5 on wayland the `App.write_to_clipboard` is not working!
+/// This is a really bad, hack that works!
+fn write_to_clipboard(cx: &mut App, item: ClipboardItem) {
+    cx.spawn(async move |cx| {
+        let mut written = false;
+
+        while !written {
+            cx.update(|cx| {
+                if cx.read_from_clipboard().as_ref() == Some(&item) {
+                    written = true;
+                } else {
+                    cx.write_to_clipboard(item.clone());
+                }
+            });
+
+            _ = std::future::pending::<()>()
+                .with_timeout(Duration::from_secs_f32(0.1), cx.background_executor())
+                .await;
+        }
+    })
+    .detach();
+}
+
+impl Render for MuzzManApp {
+    fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .track_focus(&self.focus_handle)
             .size_full()
             .bg(gpui::rgb(0x343a40))
             .flex()
@@ -1558,126 +1824,129 @@ impl Render for BlobsManApp {
                             .flex_grow()
                             .min_h(px(scale(18.0)))
                             .max_h(px(scale(18.0)))
-                            .id("grab_1")
-                            .cursor_grab()
-                            .on_mouse_down(MouseButton::Left, |_, window, _| {
-                                window.start_window_move();
-                            }),
+                            .map(title_bar_zone),
                     )
                     .child(
                         div()
                             .flex()
                             .flex_row()
-                            .child("Blobs Man")
+                            .text_color(rgb(0xffffff))
+                            .child("MuzzMan")
                             .text_size(px(scale(16.)))
-                            .child(div().child("V1").text_size(px(scale(8.))))
-                            .id("grab_2")
-                            .cursor_grab()
-                            .on_mouse_down(MouseButton::Left, |_, window, _| {
-                                window.start_window_move();
-                            }),
+                            .child(div().child("V0").text_size(px(scale(8.))))
+                            .map(title_bar_zone),
                     )
                     .child(
                         div()
                             .flex_grow()
                             .min_h(px(scale(18.0)))
                             .max_h(px(scale(18.0)))
-                            .id("grab_3")
-                            .cursor_grab()
-                            .on_mouse_down(MouseButton::Left, |_, window, _| {
-                                window.start_window_move();
-                            }),
+                            .map(title_bar_zone),
                     )
                     .child(
                         svg()
                             .text_color(rgb(0xffffff))
                             .path("close")
+                            .id("close_button")
                             .min_w(px(scale(16.)))
                             .min_h(px(scale(16.)))
                             .max_w(px(scale(16.)))
                             .max_h(px(scale(16.)))
-                            .id("close_button")
                             .cursor_pointer()
-                            .on_click(|_, window, _| {
-                                window.remove_window();
+                            .when(cfg![target_os = "windows"], |this| {
+                                this.window_control_area(gpui::WindowControlArea::Close)
+                            })
+                            .when(cfg![target_os = "linux"], |this| {
+                                this.on_click(|_, window, _| {
+                                    window.remove_window();
+                                })
                             }),
                     )
                     .child(div().min_w(px(scale(2.)))),
             )
             .child(
                 div()
-                    .text_color(rgb(0xffd43b))
-                    .text_size(px(scale(10.)))
-                    .text_center()
-                    .child("Using this application will leak your current IP address!"),
-            )
-            .child(
-                div()
                     .flex()
                     .flex_col()
-                    .items_center()
-                    .text_size(px(scale(8.)))
-                    .child(
-                        div().flex().flex_row().child("Drop files or").child(
-                            div()
-                                .left(px(scale(4.0)))
-                                .child("Browse files")
-                                .text_color(rgb(0x1c7ed6))
-                                .id("Browse files")
-                                .cursor(CursorStyle::PointingHand)
-                                .hover(|s| s.text_color(rgb(0x1971c2)))
-                                .on_click(cx.listener(|_this, _, _, cx| {
-                                    let prompt = cx.prompt_for_paths(PathPromptOptions {
-                                        files: true,
-                                        directories: cx.can_select_mixed_files_and_dirs(),
-                                        multiple: true,
-                                        prompt: Some("Import files".into()),
-                                    });
-
-                                    cx.spawn(async move |this, cx| {
-                                        let result = prompt.await;
-
-                                        if let Ok(Ok(Some(files))) = result {
-                                            let this = this.upgrade().unwrap();
-                                            this.update(cx, move |this, cx| {
-                                                let files = files
-                                                    .iter()
-                                                    .map(|path| get_files(path))
-                                                    .reduce(|mut acc, e| {
-                                                        acc.extend(e);
-                                                        acc
-                                                    })
-                                                    .unwrap_or_default();
-
-                                                this.add_files(files, cx);
-                                            });
-                                        }
-                                    })
-                                    .detach();
-                                })),
-                        ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .ml(px(scale(4.)))
-                    .mr(px(scale(4.)))
-                    .bg(rgb(0x212529))
-                    .text_color(rgb(0xffffffff))
-                    .text_size(px(scale(14.)))
-                    .child(self.text_input.clone())
-                    .child(div().h(px(scale(1.0))).flex().flex_grow().bg(rgb(0xB1B2B5)))
+                    .track_focus(&self.focus_handle)
                     .child(
                         div()
-                            .text_size(px(scale(14.0)))
-                            .child("Status: Waiting for Files or URL"),
-                    ),
+                            .text_color(rgb(0xffd43b))
+                            .text_size(px(scale(10.)))
+                            .text_center()
+                            .child("Using this application will leak your current IP address!"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .text_size(px(scale(8.)))
+                            .child(
+                                div().flex().flex_row().child("Drop files or").child(
+                                    div()
+                                        .left(px(scale(4.0)))
+                                        .child("Browse files")
+                                        .text_color(rgb(0x1c7ed6))
+                                        .id("Browse files")
+                                        .cursor(CursorStyle::PointingHand)
+                                        .hover(|s| s.text_color(rgb(0x1971c2)))
+                                        .on_click(cx.listener(|_this, _, _, cx| {
+                                            let prompt = cx.prompt_for_paths(PathPromptOptions {
+                                                files: true,
+                                                directories: cx.can_select_mixed_files_and_dirs(),
+                                                multiple: true,
+                                                prompt: Some("Import files".into()),
+                                            });
+
+                                            cx.spawn(async move |this, cx| {
+                                                let result = prompt.await;
+
+                                                if let Ok(Ok(Some(files))) = result {
+                                                    let this = this.upgrade().unwrap();
+                                                    this.update(cx, move |this, cx| {
+                                                        let files = files
+                                                            .iter()
+                                                            .map(|path| get_files(path))
+                                                            .reduce(|mut acc, e| {
+                                                                acc.extend(e);
+                                                                acc
+                                                            })
+                                                            .unwrap_or_default();
+
+                                                        this.add_files(files, cx);
+                                                    });
+                                                }
+                                            })
+                                            .detach();
+                                        })),
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .ml(px(scale(4.)))
+                            .mr(px(scale(4.)))
+                            .bg(rgb(0x212529))
+                            .text_color(rgb(0xffffffff))
+                            .text_size(px(scale(14.)))
+                            .child(self.text_input.clone())
+                            .child(div().h(px(scale(1.0))).flex().flex_grow().bg(rgb(0xB1B2B5)))
+                            .child(
+                                div()
+                                    .text_size(px(scale(14.0)))
+                                    .child("Status: Waiting for Files or URL"),
+                            ),
+                    )
+                    .text_color(gpui::white())
+                    .child(self.tree.clone()),
             )
-            .text_color(gpui::white())
-            .child(self.tree.clone())
-            .child(window_resize_frame())
+            .when(
+                cfg![target_os = "linux"] && !(window.is_fullscreen() || window.is_maximized()),
+                |this| this.child(window_resize_frame()),
+            )
     }
 }
 
@@ -1783,6 +2052,24 @@ pub fn window_resize_frame() -> Div {
         )
 }
 
+pub fn title_bar_zone(this: Div) -> Div {
+    this.on_mouse_down(MouseButton::Right, |event, window, _| {
+        window.show_window_menu(event.position);
+    })
+    .when(cfg![target_os = "windows"], |this| {
+        this.window_control_area(gpui::WindowControlArea::Drag)
+    })
+    .when(cfg![target_os = "linux"], |this| {
+        this.on_mouse_down(MouseButton::Left, |event, window, _| {
+            if event.click_count == 2 {
+                window.zoom_window();
+            } else {
+                window.start_window_move();
+            }
+        })
+    })
+}
+
 fn main() {
     let application = gpui::Application::new().with_assets(Assets {});
 
@@ -1833,11 +2120,12 @@ fn main() {
                         ))),
                         window_decorations: Some(WindowDecorations::Client),
                         window_min_size: Some(size(px(scale(350.)), px(scale(100.)))),
+                        titlebar: Some(TitlebarOptions{title: Some("MuzzMan".into()), appears_transparent: true, traffic_light_position: None}),
+                        window_background: gpui::WindowBackgroundAppearance::Opaque,
                         ..Default::default()
                     },
-                    |window, cx| {
-                        window.set_window_title("Blobs Man");
-                        cx.new::<BlobsManApp>(|cx| {
+                    |_, cx| {
+                        cx.new::<MuzzManApp>(|cx| {
                             let on_submit = cx.listener(|this, text: &SharedString, _, cx|{
                                 this.handle_url(text, cx);
                             });
@@ -1869,13 +2157,14 @@ fn main() {
                                         }
                                 }
                             }).detach();
-                            BlobsManApp {
+                            MuzzManApp {
                                 text_input,
                                 focus_handle: cx.focus_handle(),
                                 tree: cx.new(|_cx| Tree{ entries: vec![], all_entries: HashMap::default() } ),
-                                settings: Settings{
+                                settings: Settings {
                                     auto_collection: true,
                                     auto_download: false,
+                                    auto_expand: true,
                                 },
 
                                 sender,
