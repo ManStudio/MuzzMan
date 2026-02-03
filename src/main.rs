@@ -1,19 +1,25 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
+    convert::Infallible,
     path::{Path, PathBuf},
+    pin::Pin,
     str::FromStr,
-    sync::atomic::AtomicU64,
+    sync::{Arc, atomic::AtomicU64},
     time::{Duration, Instant},
 };
 
 use blobsman_graphics::{
-    futures_util::StreamExt,
+    futures_util::{self, StreamExt},
     gpui::{
-        self, AssetSource, ClipboardItem, Div, EventEmitter, FutureExt, PathPromptOptions,
-        ScrollHandle, TitlebarOptions, WindowDecorations, anchored, deferred, svg,
+        self, AnyElement, AssetSource, ClipboardItem, Div, EventEmitter, FutureExt,
+        PathPromptOptions, ScrollHandle, TitlebarOptions, WindowDecorations, anchored, deferred,
+        svg,
     },
     gpui_tokio,
-    iroh::{self, EndpointAddr, PublicKey},
+    iroh::{
+        self, EndpointAddr, PublicKey, Watcher,
+        endpoint::{ConnectionInfo, PathInfoList},
+    },
     iroh_blobs::{
         self, Hash, HashAndFormat,
         api::{
@@ -77,6 +83,11 @@ impl AssetSource for Assets {
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub fn next_id() -> u64 {
     NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+}
+
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+pub fn next_connection_id() -> u64 {
+    NEXT_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
 }
 
 #[derive(Clone)]
@@ -159,6 +170,7 @@ impl Element for TrackBounds {
 
 #[derive(Clone)]
 pub enum Entry {
+    Connections(Entity<EntryConnections>),
     Blob(Entity<EntryBlob>),
     Collection(Entity<EntryCollection>),
 }
@@ -212,12 +224,19 @@ pub struct EntryBlob {
     status: EntryStatus,
     name: SharedString,
 
-    expanded: bool,
-    show_context_menu: bool,
-    track_bounds: Entity<Bounds<Pixels>>,
-    entry_header_hovered: bool,
-    context_menu_hovered: bool,
-    context_menu_offset_x: Pixels,
+    entry_base: EntryBase<Infallible>,
+}
+
+impl AsRef<EntryBase<Infallible>> for EntryBlob {
+    fn as_ref(&self) -> &EntryBase<Infallible> {
+        &self.entry_base
+    }
+}
+
+impl AsMut<EntryBase<Infallible>> for EntryBlob {
+    fn as_mut(&mut self) -> &mut EntryBase<Infallible> {
+        &mut self.entry_base
+    }
 }
 
 pub struct EntryCollection {
@@ -225,7 +244,25 @@ pub struct EntryCollection {
     hash: Hash,
     name: SharedString,
 
-    entries: Vec<Entity<EntryBlob>>,
+    entry_base: EntryBase<Entity<EntryBlob>>,
+}
+
+impl AsRef<EntryBase<Entity<EntryBlob>>> for EntryCollection {
+    fn as_ref(&self) -> &EntryBase<Entity<EntryBlob>> {
+        &self.entry_base
+    }
+}
+
+impl AsMut<EntryBase<Entity<EntryBlob>>> for EntryCollection {
+    fn as_mut(&mut self) -> &mut EntryBase<Entity<EntryBlob>> {
+        &mut self.entry_base
+    }
+}
+
+impl EventEmitter<Event> for EntryCollection {}
+
+pub struct EntryBase<Entry> {
+    entries: Vec<Entry>,
     expanded: bool,
     show_context_menu: bool,
     track_bounds: Entity<Bounds<Pixels>>,
@@ -234,472 +271,490 @@ pub struct EntryCollection {
     context_menu_offset_x: Pixels,
 }
 
-impl EventEmitter<Event> for EntryCollection {}
-
-impl Render for EntryCollection {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut result = div().flex().flex_col().child(
-            div()
-                .flex()
-                .flex_col()
-                .min_h(px(scale(17.)))
-                .max_h(px(scale(17.)))
-                .bg(rgb(0x495057))
-                .text_size(px(scale(14.0)))
-                .id("entry")
-                .child(TrackBounds {
-                    bounds: self.track_bounds.clone(),
-                })
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .min_h(px(scale(17.)))
-                        .max_h(px(scale(17.)))
-                        .id("header_name")
-                        .items_center()
-                        .overflow_x_scroll()
-                        .child(div().min_w(px(scale(3.))).max_w(px(scale(3.))))
-                        .child(
-                            svg()
-                                .flex()
-                                .text_color(rgb(0xffffff))
-                                .path(SharedString::new_static(if self.expanded {
-                                    "arrow_downward"
-                                } else {
-                                    "arrow_right"
-                                }))
-                                .min_w(px(scale(14.)))
-                                .min_h(px(scale(14.)))
-                                .max_w(px(scale(14.)))
-                                .max_h(px(scale(14.)))
-                                .id("expand")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.expanded = !this.expanded;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(self.name.clone())
-                        .child(div().flex().flex_grow())
-                        .when(self.hash != Hash::EMPTY, |this| {
-                            this.child(
-                                svg()
-                                    .flex()
-                                    .text_color(rgb(0xffffff))
-                                    .path(SharedString::new_static("share"))
-                                    .min_w(px(scale(14.)))
-                                    .min_h(px(scale(14.)))
-                                    .max_w(px(scale(14.)))
-                                    .max_h(px(scale(14.)))
-                                    .id("share")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        cx.emit(Event::ShareCollection {
-                                            entry_id: this.id,
-                                            me: false,
-                                        });
-                                    })),
-                            )
-                        })
-                        .child(div().min_w(px(scale(2.)))),
-                )
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                        this.show_context_menu = true;
-                        let t = this.track_bounds.read(cx);
-                        this.context_menu_offset_x = event.position.x - t.origin.x;
-                        cx.notify();
-                    }),
-                )
-                .on_hover(cx.listener(|this, hovered, _window, cx| {
-                    this.entry_header_hovered = *hovered;
-                    cx.notify();
-                })),
-        ); // header
-
-        if self.expanded && !self.entries.is_empty() {
-            let mut content = div()
-                .flex()
-                .flex_col()
-                .flex_grow()
-                .bg(rgb(0x212529))
-                .pb(px(scale(4.)))
-                .pt(px(scale(4.)));
-
-            for entry in self.entries.iter() {
-                content = content.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .child(entry.clone())
-                        .pt(px(scale(4.0)))
-                        .pb(px(scale(4.0)))
-                        .pl(px(scale(8.0))),
-                );
-            }
-
-            let outer_body = div().flex().flex_col().pl(px(scale(9.0))).child(
-                div().flex().bg(rgb(0x495057)).flex_col().child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .child(content)
-                        .pl(px(scale(2.)))
-                        .pb(px(scale(2.))),
-                ),
-            );
-
-            result = result.child(outer_body); //body
+impl<T> EntryBase<T> {
+    pub fn new(cx: &mut App) -> Self {
+        Self {
+            entries: Vec::default(),
+            expanded: false,
+            show_context_menu: false,
+            track_bounds: cx.new(|_| Bounds::default()),
+            entry_header_hovered: false,
+            context_menu_hovered: false,
+            context_menu_offset_x: px(0.),
         }
+    }
+}
 
-        if !(self.entry_header_hovered || self.context_menu_hovered) {
-            self.show_context_menu = false;
-        }
-
-        result.when(self.show_context_menu, |this| {
-            this.child(deferred(
-                anchored()
-                    .anchor(gpui::Corner::TopLeft)
-                    .offset(Point {
-                        x: self.context_menu_offset_x - px(scale(20.)),
-                        y: px(scale(17.)),
-                    })
-                    .position_mode(gpui::AnchoredPositionMode::Local)
-                    .snap_to_window()
+fn entry_base<E, T: AsRef<EntryBase<E>> + AsMut<EntryBase<E>> + 'static>(
+    entry_base: &mut T,
+    name: SharedString,
+    header_buttons: impl FnOnce(&mut Context<T>) -> AnyElement,
+    get_entry: impl Fn(&E, &mut Context<T>) -> AnyElement,
+    context_menu: impl FnOnce(&mut Context<T>) -> AnyElement,
+    _window: &mut Window,
+    cx: &mut Context<T>,
+) -> impl IntoElement {
+    let mut result = div().flex().flex_col().child(
+        div()
+            .flex()
+            .flex_col()
+            .min_h(px(25.))
+            .max_h(px(25.))
+            .bg(rgb(0x495057))
+            .text_size(px(16.0))
+            .id("entry")
+            .child(TrackBounds {
+                bounds: entry_base.as_ref().track_bounds.clone(),
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .min_h(px(25.))
+                    .max_h(px(25.))
+                    .items_center()
+                    .child(
+                        svg()
+                            .flex()
+                            .text_color(rgb(0xffffff))
+                            .path(SharedString::new_static(if entry_base.as_ref().expanded {
+                                "arrow_downward"
+                            } else {
+                                "arrow_right"
+                            }))
+                            .min_w(px(25.))
+                            .min_h(px(25.))
+                            .max_w(px(25.))
+                            .max_h(px(25.))
+                            .id("expand")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.as_mut().expanded = !this.as_ref().expanded;
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         div()
                             .flex()
-                            .flex_col()
-                            .bg(rgb(0x212121))
+                            .flex_row()
+                            .min_h(px(25.))
+                            .max_h(px(25.))
+                            .id("header_name")
+                            .overflow_scroll()
                             .child(
                                 div()
-                                    .mb(px(scale(1.)))
-                                    .ml(px(scale(1.)))
-                                    .mr(px(scale(1.)))
-                                    .bg(rgb(0x495057)) // 0x343a40
-                                    .text_size(px(scale(8.)))
-                                    .child(
-                                        div()
-                                            .bg(rgb(0x212121))
-                                            .mt(px(scale(1.0)))
-                                            .child("Share")
-                                            .id("share")
-                                            .hover(|s| s.bg(rgb(0x2f2f2f)))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                cx.emit(Event::ShareCollection {
-                                                    entry_id: this.id,
-                                                    me: false,
-                                                });
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .bg(rgb(0x212121))
-                                            .mt(px(scale(1.0)))
-                                            .child("Export")
-                                            .id("export")
-                                            .hover(|s| s.bg(rgb(0x2f2f2f)))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                cx.emit(Event::Export { entry_id: this.id })
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .bg(rgb(0x212121))
-                                            .mt(px(scale(1.0)))
-                                            .child("Remove")
-                                            .id("remove")
-                                            .hover(|s| s.bg(rgb(0x2f2f2f))),
-                                    ),
-                            )
-                            .id("context_menu")
-                            .on_hover(cx.listener(|this, hovered, _, cx| {
-                                this.context_menu_hovered = *hovered;
-                                cx.notify();
+                                    .flex()
+                                    .flex_row()
+                                    .min_h(px(25.))
+                                    .max_h(px(25.))
+                                    .items_center()
+                                    .child(name.clone()),
+                            ),
+                    )
+                    .child(div().flex().flex_grow())
+                    .child(header_buttons(cx))
+                    .child(div().min_w(px(4.))),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.as_mut().show_context_menu = true;
+                    let t = this.as_ref().track_bounds.read(cx);
+                    this.as_mut().context_menu_offset_x = event.position.x - t.origin.x;
+                    cx.notify();
+                }),
+            )
+            .on_hover(cx.listener(|this, hovered, _window, cx| {
+                this.as_mut().entry_header_hovered = *hovered;
+                cx.notify();
+            })),
+    ); // header
+
+    if entry_base.as_ref().expanded && !entry_base.as_ref().entries.is_empty() {
+        let mut content = div()
+            .flex()
+            .flex_col()
+            .flex_grow()
+            .bg(rgb(0x212529))
+            .pb(px(4.));
+
+        for entry in entry_base.as_ref().entries.iter() {
+            content = content.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(get_entry(entry, cx))
+                    .pt(px(4.0))
+                    .pl(px(4.0)),
+            );
+        }
+
+        let outer_body = div().flex().flex_col().pl(px(11.)).child(
+            div()
+                .flex()
+                .bg(rgb(0x495057))
+                .flex_col()
+                .child(div().flex().flex_col().child(content).pl(px(3.)).pb(px(3.))),
+        );
+
+        result = result.child(outer_body); //body
+    }
+
+    if !(entry_base.as_ref().entry_header_hovered || entry_base.as_ref().context_menu_hovered) {
+        entry_base.as_mut().show_context_menu = false;
+    }
+
+    result.when(entry_base.as_ref().show_context_menu, |this| {
+        this.child(deferred(
+            anchored()
+                .anchor(gpui::Corner::TopLeft)
+                .offset(Point {
+                    x: entry_base.as_ref().context_menu_offset_x - px(20.),
+                    y: px(25.),
+                })
+                .position_mode(gpui::AnchoredPositionMode::Local)
+                .snap_to_window()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .bg(rgb(0x212121))
+                        .child(
+                            div()
+                                .mb(px(2.))
+                                .ml(px(2.))
+                                .mr(px(2.))
+                                .bg(rgb(0x495057)) // 0x343a40
+                                .text_size(px(16.))
+                                .child(context_menu(cx)),
+                        )
+                        .id("context_menu")
+                        .on_hover(cx.listener(|this, hovered, _, cx| {
+                            this.as_mut().context_menu_hovered = *hovered;
+                            cx.notify();
+                        })),
+                ),
+        ))
+    })
+}
+impl Render for EntryCollection {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let hash = self.hash;
+
+        entry_base(
+            self,
+            self.name.clone(),
+            move |cx| {
+                div()
+                    .when(hash != Hash::EMPTY, |this| {
+                        this.child(
+                            svg()
+                                .flex()
+                                .text_color(rgb(0xffffff))
+                                .path(SharedString::new_static("share"))
+                                .min_w(px(25.))
+                                .min_h(px(25.))
+                                .max_w(px(25.))
+                                .max_h(px(25.))
+                                .id("share")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.emit(Event::ShareCollection {
+                                        entry_id: this.id,
+                                        me: false,
+                                    });
+                                })),
+                        )
+                    })
+                    .into_any_element()
+            },
+            |entry, _cx| entry.clone().into_any_element(),
+            |cx| {
+                div()
+                    .child(
+                        div()
+                            .bg(rgb(0x212121))
+                            .mt(px(2.0))
+                            .child("Share")
+                            .id("share")
+                            .hover(|s| s.bg(rgb(0x2f2f2f)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.emit(Event::ShareCollection {
+                                    entry_id: this.id,
+                                    me: false,
+                                });
                             })),
-                    ),
-            ))
-        })
+                    )
+                    .child(
+                        div()
+                            .bg(rgb(0x212121))
+                            .mt(px(2.0))
+                            .child("Export")
+                            .id("export")
+                            .hover(|s| s.bg(rgb(0x2f2f2f)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.emit(Event::Export { entry_id: this.id })
+                            })),
+                    )
+                    .child(
+                        div()
+                            .bg(rgb(0x212121))
+                            .mt(px(2.0))
+                            .child("Remove")
+                            .id("remove")
+                            .hover(|s| s.bg(rgb(0x2f2f2f))),
+                    )
+                    .into_any_element()
+            },
+            window,
+            cx,
+        )
     }
 }
 
 impl EventEmitter<Event> for EntryBlob {}
 
 impl Render for EntryBlob {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut result = div().flex().flex_col().child(
-            div()
-                .flex()
-                .flex_col()
-                .min_h(px(scale(17.)))
-                .max_h(px(scale(17.)))
-                .bg(rgb(0x495057))
-                .text_size(px(scale(14.0)))
-                .id("entry")
-                .child(TrackBounds {
-                    bounds: self.track_bounds.clone(),
-                })
-                .child(
-                    div()
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let hash = self.status.hash();
+        let header =
+            match &self.status {
+                EntryStatus::Importing { bytes } => div()
+                    .text_color(rgb(0x00ff00))
+                    .text_size(px(16.))
+                    .child(SharedString::from(format!(
+                        "Importing: {}",
+                        format_bytes(*bytes)
+                    ))),
+                EntryStatus::Known { .. } => div().child(
+                    svg()
                         .flex()
-                        .flex_row()
-                        .min_h(px(scale(17.)))
-                        .max_h(px(scale(17.)))
-                        .id("header_name")
-                        .items_center()
-                        .overflow_x_scroll()
-                        .child(div().min_w(px(scale(3.))).max_w(px(scale(3.))))
-                        .child(
+                        .text_color(rgb(0x00ff00))
+                        .path(SharedString::new_static("download"))
+                        .min_w(px(28.))
+                        .min_h(px(28.))
+                        .max_w(px(28.))
+                        .max_h(px(28.))
+                        .id("download")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.emit(Event::StartDownload { entry_id: this.id });
+                        })),
+                ),
+                EntryStatus::Active {
+                    total_size,
+                    current_size,
+                    ..
+                } => div()
+                    .flex()
+                    .flex_row()
+                    .when(total_size != current_size, |this| {
+                        this.child(div().text_color(rgb(0x00ff00)).text_size(px(16.)).child(
+                            format!(
+                                "{:0.2}%",
+                                (*current_size as f32 / *total_size as f32) * 100.
+                            ),
+                        ))
+                    })
+                    .when(total_size == current_size, |this| {
+                        this.child(
                             svg()
                                 .flex()
                                 .text_color(rgb(0xffffff))
-                                .path(SharedString::new_static(if self.expanded {
-                                    "arrow_downward"
-                                } else {
-                                    "arrow_right"
-                                }))
-                                .min_w(px(scale(14.)))
-                                .min_h(px(scale(14.)))
-                                .max_w(px(scale(14.)))
-                                .max_h(px(scale(14.)))
-                                .id("expand")
+                                .path(SharedString::new_static("export"))
+                                .min_w(px(28.))
+                                .min_h(px(28.))
+                                .max_w(px(28.))
+                                .max_h(px(28.))
+                                .id("export")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.expanded = !this.expanded;
-                                    cx.notify();
+                                    cx.emit(Event::Export { entry_id: this.id });
                                 })),
                         )
-                        .child(self.name.clone())
-                        .child(div().flex().flex_grow())
-                        .child(div().min_w(px(scale(2.))))
-                        .when(true, |this| match &self.status {
-                            EntryStatus::Importing { bytes } => this.child(
-                                div()
-                                    .text_color(rgb(0x00ff00))
-                                    .text_size(px(scale(8.)))
-                                    .child(SharedString::from(format!(
-                                        "Importing: {}",
-                                        format_bytes(*bytes)
-                                    ))),
-                            ),
-                            EntryStatus::Known { .. } => this.child(
-                                svg()
-                                    .flex()
-                                    .text_color(rgb(0x00ff00))
-                                    .path(SharedString::new_static("download"))
-                                    .min_w(px(scale(14.)))
-                                    .min_h(px(scale(14.)))
-                                    .max_w(px(scale(14.)))
-                                    .max_h(px(scale(14.)))
-                                    .id("download")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        cx.emit(Event::StartDownload { entry_id: this.id });
-                                    })),
-                            ),
-                            EntryStatus::Active {
-                                total_size,
-                                current_size,
-                                ..
-                            } => this
-                                .when(total_size != current_size, |this| {
-                                    this.child(
-                                        div()
-                                            .text_color(rgb(0x00ff00))
-                                            .text_size(px(scale(8.)))
-                                            .child(format!(
-                                                "{:0.2}%",
-                                                (*current_size as f32 / *total_size as f32) * 100.
-                                            )),
-                                    )
-                                })
-                                .when(total_size == current_size, |this| {
-                                    this.child(
-                                        svg()
-                                            .flex()
-                                            .text_color(rgb(0x0000ff))
-                                            .path(SharedString::new_static("export"))
-                                            .min_w(px(scale(14.)))
-                                            .min_h(px(scale(14.)))
-                                            .max_w(px(scale(14.)))
-                                            .max_h(px(scale(14.)))
-                                            .id("export")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                cx.emit(Event::Export { entry_id: this.id });
-                                            })),
-                                    )
-                                })
-                                .when(
-                                    self.status.hash().unwrap_or(Hash::EMPTY) != Hash::EMPTY,
-                                    |this| {
-                                        this.child(
-                                            svg()
-                                                .flex()
-                                                .text_color(rgb(0xffffff))
-                                                .path(SharedString::new_static("share"))
-                                                .min_w(px(scale(14.)))
-                                                .min_h(px(scale(14.)))
-                                                .max_w(px(scale(14.)))
-                                                .max_h(px(scale(14.)))
-                                                .id("share")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    cx.emit(Event::Share {
-                                                        entry_id: this.id,
-                                                        me: false,
-                                                    });
-                                                })),
-                                        )
-                                    },
-                                ),
-                        })
-                        .child(div().min_w(px(scale(2.)))),
-                )
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                        this.show_context_menu = true;
-                        let t = this.track_bounds.read(cx);
-                        this.context_menu_offset_x = event.position.x - t.origin.x;
-                        cx.notify();
-                    }),
-                )
-                .on_hover(cx.listener(|this, hovered, _window, cx| {
-                    this.entry_header_hovered = *hovered;
-                    cx.notify();
-                })),
-        ); // header
-
-        if self.expanded {
-            let mut content = div()
-                .flex()
-                .flex_col()
-                .flex_grow()
-                .bg(rgb(0x212529))
-                .pb(px(scale(4.)))
-                .pt(px(scale(4.)));
-
-            if let EntryStatus::Active {
-                downloading,
-                exporting,
-                total_size,
-                ..
-            } = &self.status
-            {
-                if let Some(id) = downloading.active
-                    && let Some(stats) = downloading.peers.get(&id)
-                {
-                    content = content.child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .text_size(px(scale(8.)))
-                            .child(format!("Donwloading from: {id}"))
-                            .child(div().flex().flex_grow())
-                            .child(
-                                div()
-                                    .text_color(rgb(0x00ff00))
-                                    .child(format!("Speed: {}s", format_bytes(stats.speed))),
-                            ),
-                    );
-                }
-
-                for (path, size) in exporting.iter() {
-                    content = content.child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .child(div().child(path.clone()))
-                            .child(div().flex().flex_grow())
-                            .child(div().child(format!(
-                                "{:0.2}%",
-                                (*size as f32 / *total_size as f32) * 100.
-                            ))),
-                    );
-                }
-            }
-
-            let outer_body = div().flex().flex_col().pl(px(scale(9.0))).child(
-                div().flex().bg(rgb(0x495057)).flex_col().child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .child(content)
-                        .pl(px(scale(2.)))
-                        .pb(px(scale(2.))),
-                ),
-            );
-
-            result = result.child(outer_body); //body
-        }
-
-        if !(self.entry_header_hovered || self.context_menu_hovered) {
-            self.show_context_menu = false;
-        }
-
-        result.when(self.show_context_menu, |this| {
-            this.child(deferred(
-                anchored()
-                    .anchor(gpui::Corner::TopLeft)
-                    .offset(Point {
-                        x: self.context_menu_offset_x - px(scale(20.)),
-                        y: px(scale(17.)),
                     })
-                    .position_mode(gpui::AnchoredPositionMode::Local)
-                    .snap_to_window()
+                    .when(hash.unwrap_or(Hash::EMPTY) != Hash::EMPTY, |this| {
+                        this.child(
+                            svg()
+                                .flex()
+                                .text_color(rgb(0xffffff))
+                                .path(SharedString::new_static("share"))
+                                .min_w(px(28.))
+                                .min_h(px(28.))
+                                .max_w(px(28.))
+                                .max_h(px(28.))
+                                .id("share")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.emit(Event::Share {
+                                        entry_id: this.id,
+                                        me: false,
+                                    });
+                                })),
+                        )
+                    }),
+            };
+        entry_base(
+            self,
+            self.name.clone(),
+            move |_cx| header.into_any_element(),
+            |entry, _cx| div().into_any_element(),
+            move |cx| {
+                div()
+                    .when(hash.is_some(), |this| {
+                        this.child(
+                            div()
+                                .bg(rgb(0x212121))
+                                .mt(px(2.0))
+                                .child("Share")
+                                .id("share")
+                                .hover(|s| s.bg(rgb(0x2f2f2f)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.emit(Event::Share {
+                                        entry_id: this.id,
+                                        me: false,
+                                    });
+                                })),
+                        )
+                    })
                     .child(
                         div()
-                            .flex()
-                            .flex_col()
                             .bg(rgb(0x212121))
-                            .child(
-                                div()
-                                    .mb(px(scale(1.)))
-                                    .ml(px(scale(1.)))
-                                    .mr(px(scale(1.)))
-                                    .bg(rgb(0x495057)) // 0x343a40
-                                    .text_size(px(scale(8.)))
-                                    .when(self.status.hash().is_some(), |this| {
-                                        this.child(
-                                            div()
-                                                .bg(rgb(0x212121))
-                                                .mt(px(scale(1.0)))
-                                                .child("Share")
-                                                .id("share")
-                                                .hover(|s| s.bg(rgb(0x2f2f2f)))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    cx.emit(Event::Share {
-                                                        entry_id: this.id,
-                                                        me: false,
-                                                    });
-                                                })),
-                                        )
-                                    })
-                                    .child(
-                                        div()
-                                            .bg(rgb(0x212121))
-                                            .mt(px(scale(1.0)))
-                                            .child("Export")
-                                            .id("export")
-                                            .hover(|s| s.bg(rgb(0x2f2f2f)))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                cx.emit(Event::Export { entry_id: this.id })
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .bg(rgb(0x212121))
-                                            .mt(px(scale(1.0)))
-                                            .child("Remove")
-                                            .id("remove")
-                                            .hover(|s| s.bg(rgb(0x2f2f2f))),
-                                    ),
-                            )
-                            .id("context_menu")
-                            .on_hover(cx.listener(|this, hovered, _, cx| {
-                                this.context_menu_hovered = *hovered;
-                                cx.notify();
+                            .mt(px(2.0))
+                            .child("Export")
+                            .id("export")
+                            .hover(|s| s.bg(rgb(0x2f2f2f)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.emit(Event::Export { entry_id: this.id })
                             })),
-                    ),
-            ))
-        })
+                    )
+                    .child(
+                        div()
+                            .bg(rgb(0x212121))
+                            .mt(px(2.0))
+                            .child("Remove")
+                            .id("remove")
+                            .hover(|s| s.bg(rgb(0x2f2f2f))),
+                    )
+                    .into_any_element()
+            },
+            window,
+            cx,
+        )
+    }
+}
+
+pub struct EntryConnections {
+    entry_base: EntryBase<Entity<EntryConnection>>,
+}
+
+impl AsRef<EntryBase<Entity<EntryConnection>>> for EntryConnections {
+    fn as_ref(&self) -> &EntryBase<Entity<EntryConnection>> {
+        &self.entry_base
+    }
+}
+
+impl AsMut<EntryBase<Entity<EntryConnection>>> for EntryConnections {
+    fn as_mut(&mut self) -> &mut EntryBase<Entity<EntryConnection>> {
+        &mut self.entry_base
+    }
+}
+
+impl Render for EntryConnections {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        entry_base(
+            self,
+            SharedString::new_static("Connections"),
+            |_| div().into_any_element(),
+            |entry, _| entry.clone().into_any_element(),
+            |_| div().into_any_element(),
+            window,
+            cx,
+        )
+    }
+}
+
+pub struct EntryConnection {
+    entry_base: EntryBase<Entity<EntryConnectionStats>>,
+    name: SharedString,
+}
+
+impl AsRef<EntryBase<Entity<EntryConnectionStats>>> for EntryConnection {
+    fn as_ref(&self) -> &EntryBase<Entity<EntryConnectionStats>> {
+        &self.entry_base
+    }
+}
+
+impl AsMut<EntryBase<Entity<EntryConnectionStats>>> for EntryConnection {
+    fn as_mut(&mut self) -> &mut EntryBase<Entity<EntryConnectionStats>> {
+        &mut self.entry_base
+    }
+}
+
+impl Render for EntryConnection {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        entry_base(
+            self,
+            self.name.clone(),
+            |_| div().into_any_element(),
+            |entry, _| entry.clone().into_any_element(),
+            |_| div().into_any_element(),
+            window,
+            cx,
+        )
+    }
+}
+
+pub struct EntryConnectionStats {
+    entry_base: EntryBase<Infallible>,
+    name: SharedString,
+    ping: Duration,
+    download_total: u64,
+    upload_total: u64,
+}
+
+impl AsRef<EntryBase<Infallible>> for EntryConnectionStats {
+    fn as_ref(&self) -> &EntryBase<Infallible> {
+        &self.entry_base
+    }
+}
+
+impl AsMut<EntryBase<Infallible>> for EntryConnectionStats {
+    fn as_mut(&mut self) -> &mut EntryBase<Infallible> {
+        &mut self.entry_base
+    }
+}
+
+impl Render for EntryConnectionStats {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let header_buttons = div()
+            .flex()
+            .flex_row()
+            .text_size(px(14.))
+            .child(
+                div()
+                    .text_color(rgb(0x00ff00))
+                    .child(format_bytes(self.download_total)),
+            )
+            .child(div().min_w(px(4.)))
+            .child(
+                div()
+                    .text_color(rgb(0x2080ff))
+                    .child(format_bytes(self.upload_total)),
+            )
+            .child(div().min_w(px(4.)))
+            .child(
+                div()
+                    .text_color(rgb(0x00ff00))
+                    .child(format!("{}ms", self.ping.as_millis())),
+            );
+
+        let context_menu = div();
+
+        entry_base(
+            self,
+            self.name.clone(),
+            |_| header_buttons.into_any_element(),
+            |_, _| div().into_any_element(),
+            |cx| context_menu.into_any_element(),
+            window,
+            cx,
+        )
     }
 }
 
@@ -715,16 +770,18 @@ impl Render for Tree {
             .flex_col()
             .flex_grow()
             .id("tree")
-            .ml(px(scale(4.0)))
-            .mr(px(scale(4.0)))
-            .mt(px(scale(4.0)))
+            .ml(px(4.0))
+            .mr(px(4.0))
             .overflow_scroll();
 
         for entry in self.entries.iter() {
             res = match entry {
-                Entry::Blob(blob) => res.child(div().mt(px(scale(4.))).child(blob.clone())),
+                Entry::Blob(blob) => res.child(div().mt(px(4.)).child(blob.clone())),
                 Entry::Collection(collection) => {
-                    res.child(div().mt(px(scale(4.))).child(collection.clone()))
+                    res.child(div().mt(px(4.)).child(collection.clone()))
+                }
+                Entry::Connections(connections) => {
+                    res.child(div().mt(px(4.)).child(connections.clone()))
                 }
             };
         }
@@ -779,6 +836,7 @@ pub enum Message {
         path: SharedString,
         size: u64,
     },
+    Connections(BTreeMap<PublicKey, BTreeMap<u64, Vec<(SharedString, Duration, u64, u64)>>>),
 }
 
 #[derive(Debug, Clone)]
@@ -857,7 +915,12 @@ impl MuzzManApp {
                                         dbg!(&hashes);
                                         let mut hashes_iterator = hashes.iter();
 
-                                        let meta_hash = hashes_iterator.next().unwrap();
+                                        let Some(meta_hash) = hashes_iterator.next() else {
+                                            eprintln!(
+                                                "Empty blob, cannot find the Collection Meta!"
+                                            );
+                                            return;
+                                        };
 
                                         dbg!(
                                             downloader
@@ -925,8 +988,6 @@ impl MuzzManApp {
     }
 
     fn update(&mut self, message: Message, cx: &mut Context<'_, MuzzManApp>) {
-        println!("Received: {message:?}");
-
         match message {
             Message::ImportCollection { entry_id, entries } => {
                 self.blob_info
@@ -951,6 +1012,7 @@ impl MuzzManApp {
                                 });
                             }
                             Entry::Collection(_) => {}
+                            Entry::Connections(entity) => {}
                         }
                     });
                 }
@@ -989,6 +1051,7 @@ impl MuzzManApp {
                                 });
                             }
                             Entry::Collection(_) => {}
+                            Entry::Connections(entity) => {}
                         }
                     });
 
@@ -1009,7 +1072,7 @@ impl MuzzManApp {
                             let collection = collection_entity.read(cx);
 
                             let mut links_and_hashes = Vec::new();
-                            for entry in collection.entries.iter() {
+                            for entry in collection.as_ref().entries.iter() {
                                 let entry = entry.read(cx);
                                 links_and_hashes
                                     .push((entry.name.as_str(), entry.status.hash().unwrap()));
@@ -1061,13 +1124,15 @@ impl MuzzManApp {
                         id: entry_id,
                         hash,
                         name: name.into(),
-                        entries: Vec::default(),
-                        expanded: false,
-                        show_context_menu: false,
-                        track_bounds: cx.new(|_| Bounds::default()),
-                        entry_header_hovered: false,
-                        context_menu_hovered: false,
-                        context_menu_offset_x: px(0.),
+                        entry_base: EntryBase {
+                            entries: Vec::default(),
+                            expanded: false,
+                            show_context_menu: false,
+                            track_bounds: cx.new(|_| Bounds::default()),
+                            entry_header_hovered: false,
+                            context_menu_hovered: false,
+                            context_menu_offset_x: px(0.),
+                        },
                     }
                 }));
 
@@ -1115,18 +1180,21 @@ impl MuzzManApp {
                                     id: entry_id,
                                     status: EntryStatus::Known { hash },
                                     name: name.into(),
-                                    expanded: false,
-                                    show_context_menu: false,
-                                    track_bounds: cx.new(|_| Bounds::default()),
-                                    entry_header_hovered: false,
-                                    context_menu_hovered: false,
-                                    context_menu_offset_x: px(0.),
+                                    entry_base: EntryBase {
+                                        entries: Vec::default(),
+                                        expanded: false,
+                                        show_context_menu: false,
+                                        track_bounds: cx.new(|_| Bounds::default()),
+                                        entry_header_hovered: false,
+                                        context_menu_hovered: false,
+                                        context_menu_offset_x: px(0.),
+                                    },
                                 }
                             });
 
                             tree.all_entries
                                 .insert(entry_id, Entry::Blob(entry.clone()));
-                            collection.entries.push(entry);
+                            collection.as_mut().entries.push(entry);
                         });
                     } else {
                         let entry = Entry::Blob(cx.new(|cx| {
@@ -1140,12 +1208,15 @@ impl MuzzManApp {
                                 id: entry_id,
                                 status: EntryStatus::Known { hash },
                                 name: name.into(),
-                                expanded: false,
-                                show_context_menu: false,
-                                track_bounds: cx.new(|_| Bounds::default()),
-                                entry_header_hovered: false,
-                                context_menu_hovered: false,
-                                context_menu_offset_x: px(0.),
+                                entry_base: EntryBase {
+                                    entries: Vec::default(),
+                                    expanded: false,
+                                    show_context_menu: false,
+                                    track_bounds: cx.new(|_| Bounds::default()),
+                                    entry_header_hovered: false,
+                                    context_menu_hovered: false,
+                                    context_menu_offset_x: px(0.),
+                                },
                             }
                         }));
 
@@ -1165,7 +1236,7 @@ impl MuzzManApp {
                 let node = self.node.clone();
                 let blobs = self.blobs.clone();
                 let hash = info.0;
-                let providers = info.1.clone();
+                let mut providers = info.1.clone();
                 let sender = self.sender.clone();
 
                 self.tree.update(cx, |tree, cx| {
@@ -1183,7 +1254,7 @@ impl MuzzManApp {
                             };
 
                             if self.settings.auto_expand {
-                                entry.expanded = true;
+                                entry.as_mut().expanded = true;
                                 cx.notify();
                             }
                         });
@@ -1252,7 +1323,7 @@ impl MuzzManApp {
                                             current_size,
                                             ..
                                         },
-                                    expanded,
+                                    entry_base: EntryBase { expanded, .. },
                                     ..
                                 } = entry
                                 else {
@@ -1303,6 +1374,7 @@ impl MuzzManApp {
                             });
                         }
                         Entry::Collection(_) => {}
+                        Entry::Connections(entity) => {}
                     }
                 });
             }
@@ -1399,7 +1471,7 @@ impl MuzzManApp {
                     Entry::Blob(entity) => {
                         if self.settings.auto_expand {
                             entity.update(cx, |blob, cx| {
-                                blob.expanded = true;
+                                blob.as_mut().expanded = true;
                                 cx.notify();
                             });
                         }
@@ -1451,7 +1523,7 @@ impl MuzzManApp {
                     Entry::Collection(entity) => {
                         if self.settings.auto_expand {
                             entity.update(cx, |collection, cx| {
-                                collection.expanded = true;
+                                collection.as_mut().expanded = true;
                                 cx.notify();
                             });
                         }
@@ -1467,7 +1539,7 @@ impl MuzzManApp {
 
                         let mut to_save = Vec::new();
 
-                        for child in collection.entries.iter() {
+                        for child in collection.as_ref().entries.iter() {
                             let entry = child.read(cx);
 
                             let Some(hash) = entry.status.hash() else {
@@ -1524,6 +1596,7 @@ impl MuzzManApp {
                         })
                         .detach();
                     }
+                    Entry::Connections(entity) => {}
                 }
             }
             Message::ExportProgress {
@@ -1544,7 +1617,116 @@ impl MuzzManApp {
                     let progress = exporting.entry(path).or_default();
                     *progress = size;
 
-                    if blob.expanded {
+                    if blob.as_ref().expanded {
+                        cx.notify();
+                    }
+                });
+            }
+            Message::Connections(mut peers_info) => {
+                let tree = self.tree.read(cx);
+                let Some(Entry::Connections(connections)) = tree.entries.first().cloned() else {
+                    return;
+                };
+
+                connections.update(cx, |connections, cx| {
+                    connections.as_mut().entries.retain(|entry| {
+                        entry.update(cx, |peer_entry, cx| {
+                            let mut peer_id_for_entry = None;
+
+                            for peer_id in peers_info.keys() {
+                                if peer_entry.name != peer_id.to_string() {
+                                    continue;
+                                }
+
+                                peer_id_for_entry = Some(*peer_id);
+
+                                break;
+                            }
+
+                            let Some(peer_id) = peer_id_for_entry else {
+                                return false;
+                            };
+
+                            let mut peer_info = peers_info.remove(&peer_id).unwrap();
+
+                            peer_entry.as_mut().entries.retain(|connections_entry| {
+                                connections_entry.update(cx, |connection, cx| {
+                                    let mut peer_info_uid = None;
+                                    let mut peer_info_idx = None;
+
+                                    for (uid, peer_info) in peer_info.iter() {
+                                        for (i, route) in peer_info.iter().enumerate() {
+                                            if route.0 != connection.name {
+                                                continue;
+                                            }
+
+                                            peer_info_uid = Some(*uid);
+                                            peer_info_idx = Some(i);
+
+                                            break;
+                                        }
+                                    }
+
+                                    let Some(peer_info_uid) = peer_info_uid else {
+                                        return false;
+                                    };
+                                    let Some(peer_info_idx) = peer_info_idx else {
+                                        return false;
+                                    };
+                                    let Some(peer_info) = peer_info.get_mut(&peer_info_uid) else {
+                                        return false;
+                                    };
+
+                                    let route = peer_info.remove(peer_info_idx);
+
+                                    connection.ping = route.1;
+                                    connection.download_total = route.2;
+                                    connection.upload_total = route.3;
+                                    cx.notify();
+                                    true
+                                })
+                            });
+
+                            for peer_info in peer_info.values() {
+                                for peer_info in peer_info {
+                                    peer_entry.as_mut().entries.push(cx.new(|cx| {
+                                        EntryConnectionStats {
+                                            entry_base: EntryBase::new(cx),
+                                            name: peer_info.0.clone(),
+                                            ping: peer_info.1,
+                                            download_total: peer_info.2,
+                                            upload_total: peer_info.3,
+                                        }
+                                    }));
+                                    cx.notify();
+                                }
+                            }
+
+                            !peer_entry.as_ref().entries.is_empty()
+                        })
+                    });
+
+                    for (peer_id, peer_info) in peers_info.iter() {
+                        connections.as_mut().entries.push(cx.new(move |cx| {
+                            let mut peer_entry = EntryConnection {
+                                entry_base: EntryBase::new(cx),
+                                name: peer_id.to_string().into(),
+                            };
+                            for peer_info in peer_info.values() {
+                                for peer_info in peer_info {
+                                    peer_entry.as_mut().entries.push(cx.new(|cx| {
+                                        EntryConnectionStats {
+                                            entry_base: EntryBase::new(cx),
+                                            name: peer_info.0.clone(),
+                                            ping: peer_info.1,
+                                            download_total: peer_info.2,
+                                            upload_total: peer_info.3,
+                                        }
+                                    }));
+                                }
+                            }
+                            peer_entry
+                        }));
                         cx.notify();
                     }
                 });
@@ -1651,12 +1833,15 @@ impl MuzzManApp {
                             status: EntryStatus::Importing { bytes: 0 },
                             id,
                             name,
-                            expanded: false,
-                            show_context_menu: false,
-                            track_bounds: cx.new(|_cx| Bounds::default()),
-                            entry_header_hovered: false,
-                            context_menu_hovered: false,
-                            context_menu_offset_x: px(0.),
+                            entry_base: EntryBase {
+                                entries: Vec::default(),
+                                expanded: false,
+                                show_context_menu: false,
+                                track_bounds: cx.new(|_cx| Bounds::default()),
+                                entry_header_hovered: false,
+                                context_menu_hovered: false,
+                                context_menu_offset_x: px(0.),
+                            },
                         }
                     });
 
@@ -1686,13 +1871,15 @@ impl MuzzManApp {
                         id: collection_id,
                         hash: Hash::EMPTY,
                         name,
-                        entries,
-                        expanded: false,
-                        show_context_menu: false,
-                        track_bounds: cx.new(|_cx| Bounds::default()),
-                        entry_header_hovered: false,
-                        context_menu_hovered: false,
-                        context_menu_offset_x: px(0.),
+                        entry_base: EntryBase {
+                            entries,
+                            expanded: false,
+                            show_context_menu: false,
+                            track_bounds: cx.new(|_cx| Bounds::default()),
+                            entry_header_hovered: false,
+                            context_menu_hovered: false,
+                            context_menu_offset_x: px(0.),
+                        },
                     }
                 }));
 
@@ -1748,12 +1935,15 @@ impl MuzzManApp {
                         status: EntryStatus::Importing { bytes: 0 },
                         id,
                         name,
-                        expanded: false,
-                        show_context_menu: false,
-                        track_bounds: cx.new(|_cx| Bounds::default()),
-                        entry_header_hovered: false,
-                        context_menu_hovered: false,
-                        context_menu_offset_x: px(0.),
+                        entry_base: EntryBase {
+                            entries: Vec::default(),
+                            expanded: false,
+                            show_context_menu: false,
+                            track_bounds: cx.new(|_cx| Bounds::default()),
+                            entry_header_hovered: false,
+                            context_menu_hovered: false,
+                            context_menu_offset_x: px(0.),
+                        },
                     }
                 }));
 
@@ -1813,17 +2003,17 @@ impl Render for MuzzManApp {
             .child(
                 div()
                     .bg(rgb(0x212529))
-                    .min_h(px(scale(21.0)))
-                    .max_h(px(scale(21.0)))
+                    .min_h(px(42.0))
+                    .max_h(px(42.0))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .child(div().min_w(px(scale(2.))))
+                    .child(div().min_w(px(4.)))
                     .child(
                         div()
                             .flex_grow()
-                            .min_h(px(scale(18.0)))
-                            .max_h(px(scale(18.0)))
+                            .min_h(px(30.0))
+                            .max_h(px(30.0))
                             .map(title_bar_zone),
                     )
                     .child(
@@ -1832,15 +2022,15 @@ impl Render for MuzzManApp {
                             .flex_row()
                             .text_color(rgb(0xffffff))
                             .child("MuzzMan")
-                            .text_size(px(scale(16.)))
-                            .child(div().child("V0").text_size(px(scale(8.))))
+                            .text_size(px(32.))
+                            .child(div().child("V0").text_size(px(16.)))
                             .map(title_bar_zone),
                     )
                     .child(
                         div()
                             .flex_grow()
-                            .min_h(px(scale(18.0)))
-                            .max_h(px(scale(18.0)))
+                            .min_h(px(30.0))
+                            .max_h(px(30.0))
                             .map(title_bar_zone),
                     )
                     .child(
@@ -1848,10 +2038,10 @@ impl Render for MuzzManApp {
                             .text_color(rgb(0xffffff))
                             .path("close")
                             .id("close_button")
-                            .min_w(px(scale(16.)))
-                            .min_h(px(scale(16.)))
-                            .max_w(px(scale(16.)))
-                            .max_h(px(scale(16.)))
+                            .min_w(px(32.))
+                            .min_h(px(32.))
+                            .max_w(px(32.))
+                            .max_h(px(32.))
                             .cursor_pointer()
                             .when(cfg![target_os = "windows"], |this| {
                                 this.window_control_area(gpui::WindowControlArea::Close)
@@ -1862,7 +2052,7 @@ impl Render for MuzzManApp {
                                 })
                             }),
                     )
-                    .child(div().min_w(px(scale(2.)))),
+                    .child(div().min_w(px(4.))),
             )
             .child(
                 div()
@@ -1872,7 +2062,7 @@ impl Render for MuzzManApp {
                     .child(
                         div()
                             .text_color(rgb(0xffd43b))
-                            .text_size(px(scale(10.)))
+                            .text_size(px(20.))
                             .text_center()
                             .child("Using this application will leak your current IP address!"),
                     )
@@ -1881,11 +2071,11 @@ impl Render for MuzzManApp {
                             .flex()
                             .flex_col()
                             .items_center()
-                            .text_size(px(scale(8.)))
+                            .text_size(px(16.))
                             .child(
                                 div().flex().flex_row().child("Drop files or").child(
                                     div()
-                                        .left(px(scale(4.0)))
+                                        .left(px(4.0))
                                         .child("Browse files")
                                         .text_color(rgb(0x1c7ed6))
                                         .id("Browse files")
@@ -1927,22 +2117,18 @@ impl Render for MuzzManApp {
                         div()
                             .flex()
                             .flex_col()
-                            .ml(px(scale(4.)))
-                            .mr(px(scale(4.)))
+                            .ml(px(4.))
+                            .mr(px(4.))
                             .bg(rgb(0x212529))
                             .text_color(rgb(0xffffffff))
-                            .text_size(px(scale(14.)))
+                            .text_size(px(21.))
                             .child(self.text_input.clone())
-                            .child(div().h(px(scale(1.0))).flex().flex_grow().bg(rgb(0xB1B2B5)))
-                            .child(
-                                div()
-                                    .text_size(px(scale(14.0)))
-                                    .child("Status: Waiting for Files or URL"),
-                            ),
-                    )
-                    .text_color(gpui::white())
-                    .child(self.tree.clone()),
+                            .child(div().h(px(2.0)).flex().flex_grow().bg(rgb(0xB1B2B5)))
+                            .child(div().child("Status: Waiting for Files or URL")),
+                    ),
             )
+            .text_color(gpui::white())
+            .child(self.tree.clone())
             .when(
                 cfg![target_os = "linux"] && !(window.is_fullscreen() || window.is_maximized()),
                 |this| this.child(window_resize_frame()),
@@ -1963,8 +2149,8 @@ pub fn window_resize_frame() -> Div {
                 .w_full()
                 .child(
                     div()
-                        .w(px(scale(5.)))
-                        .h(px(scale(5.)))
+                        .w(px(5.))
+                        .h(px(5.))
                         .cursor_nwse_resize()
                         .on_mouse_down(MouseButton::Left, |_, w, _| {
                             w.start_window_resize(gpui::ResizeEdge::TopLeft);
@@ -1974,8 +2160,8 @@ pub fn window_resize_frame() -> Div {
                     div()
                         .flex()
                         .flex_grow()
-                        .min_h(px(scale(1.)))
-                        .max_h(px(scale(1.)))
+                        .min_h(px(3.))
+                        .max_h(px(3.))
                         .cursor_n_resize()
                         .on_mouse_down(MouseButton::Left, |_, w, _| {
                             w.start_window_resize(gpui::ResizeEdge::Top);
@@ -1983,8 +2169,8 @@ pub fn window_resize_frame() -> Div {
                 )
                 .child(
                     div()
-                        .w(px(scale(5.)))
-                        .h(px(scale(5.)))
+                        .w(px(5.))
+                        .h(px(5.))
                         .cursor_nesw_resize()
                         .on_mouse_down(MouseButton::Left, |_, w, _| {
                             w.start_window_resize(gpui::ResizeEdge::TopRight);
@@ -1998,7 +2184,7 @@ pub fn window_resize_frame() -> Div {
                 .child(
                     div()
                         .flex_grow()
-                        .max_w(px(scale(1.0)))
+                        .max_w(px(3.0))
                         .cursor_ew_resize()
                         .on_mouse_down(MouseButton::Left, |_, w, _| {
                             w.start_window_resize(gpui::ResizeEdge::Left);
@@ -2008,7 +2194,7 @@ pub fn window_resize_frame() -> Div {
                 .child(
                     div()
                         .flex_grow()
-                        .max_w(px(scale(1.0)))
+                        .max_w(px(3.0))
                         .cursor_ew_resize()
                         .on_mouse_down(MouseButton::Left, |_, w, _| {
                             w.start_window_resize(gpui::ResizeEdge::Right);
@@ -2022,8 +2208,8 @@ pub fn window_resize_frame() -> Div {
                 .items_end()
                 .child(
                     div()
-                        .w(px(scale(5.)))
-                        .h(px(scale(5.)))
+                        .w(px(5.))
+                        .h(px(5.))
                         .cursor_nesw_resize()
                         .on_mouse_down(MouseButton::Left, |_, w, _| {
                             w.start_window_resize(gpui::ResizeEdge::BottomLeft);
@@ -2033,8 +2219,8 @@ pub fn window_resize_frame() -> Div {
                     div()
                         .flex()
                         .flex_grow()
-                        .min_h(px(scale(1.)))
-                        .max_h(px(scale(1.)))
+                        .min_h(px(3.))
+                        .max_h(px(3.))
                         .cursor_s_resize()
                         .on_mouse_down(MouseButton::Left, |_, w, _| {
                             w.start_window_resize(gpui::ResizeEdge::Bottom);
@@ -2042,8 +2228,8 @@ pub fn window_resize_frame() -> Div {
                 )
                 .child(
                     div()
-                        .w(px(scale(5.)))
-                        .h(px(scale(5.)))
+                        .w(px(5.))
+                        .h(px(5.))
                         .cursor_nwse_resize()
                         .on_mouse_down(MouseButton::Left, |_, w, _| {
                             w.start_window_resize(gpui::ResizeEdge::BottomRight);
@@ -2070,6 +2256,43 @@ pub fn title_bar_zone(this: Div) -> Div {
     })
 }
 
+#[derive(Clone)]
+pub struct Connections {
+    peers: Arc<tokio::sync::RwLock<BTreeMap<PublicKey, Vec<(ConnectionInfo, u64)>>>>,
+    sender: tokio::sync::mpsc::Sender<()>,
+}
+
+struct IrohHooks(Connections);
+
+impl std::fmt::Debug for IrohHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("IrohHooks").finish()
+    }
+}
+impl iroh::endpoint::EndpointHooks for IrohHooks {
+    async fn before_connect<'a>(
+        &'a self,
+        _remote_addr: &'a EndpointAddr,
+        _alpn: &'a [u8],
+    ) -> iroh::endpoint::BeforeConnectOutcome {
+        iroh::endpoint::BeforeConnectOutcome::Accept
+    }
+
+    async fn after_handshake<'a>(
+        &'a self,
+        conn: &'a iroh::endpoint::ConnectionInfo,
+    ) -> iroh::endpoint::AfterHandshakeOutcome {
+        {
+            let mut nodes = self.0.peers.write().await;
+            let entry = nodes.entry(conn.remote_id()).or_default();
+            entry.push((conn.clone(), next_connection_id()));
+        }
+        _ = self.0.sender.send(()).await;
+
+        iroh::endpoint::AfterHandshakeOutcome::accept()
+    }
+}
+
 fn main() {
     let application = gpui::Application::new().with_assets(Assets {});
 
@@ -2092,11 +2315,102 @@ fn main() {
             KeyBinding::new("enter", Submit, None),
         ]);
 
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Message>(1024);
+        let app_sender = sender.clone();
+
         let init = gpui_tokio::Tokio::spawn(cx, async {
-            let endpoint = iroh::Endpoint::builder().bind().await.unwrap();
+            let (connections_sender, mut connections_receiver) = tokio::sync::mpsc::channel(1024);
+            let connections = Connections{ peers: Arc::default(), sender: connections_sender };
+
+            {
+                let peers = connections.peers.clone();
+                Box::leak(Box::new(tokio::spawn(async move{
+                    let mut streams = BTreeSet::default();
+                    let mut tasks = Vec::<Pin<Box<dyn Future<Output = (Option<PathInfoList>, u64, _)> + Send + Sync>>>::default();
+
+                    loop{
+                        {
+                            let mut peers = peers.write().await;
+                            let mut peers_info = BTreeMap::default();
+                            for (node_id, routes) in peers.iter_mut(){
+                                routes.retain(|c|c.0.is_alive());
+
+                                let mut connections = BTreeMap::default();
+                                for (connection_info, id) in routes.iter_mut(){
+                                    let id = *id;
+                                    let alpn = String::from_utf8(connection_info.alpn().to_vec()).unwrap_or_else(|_|format!("{:?}", connection_info.alpn()));
+                                    let mut paths = Vec::default();
+                                    for path in connection_info.paths().get(){
+                                        let info = (match path.remote_addr() {
+                                           iroh::TransportAddr::Relay(relay_url) => {
+                                               SharedString::new(format!("Alpn: {alpn}, Relay: {}", relay_url))
+                                           },
+                                           iroh::TransportAddr::Ip(socket_addr) => {
+                                               SharedString::new(format!("Alpn: {alpn}, Ip: {}", socket_addr))
+                                           },
+                                           _ => {eprintln!("Unknown TransportAddr"); SharedString::new_static("Unknown TransportAddr")},
+                                       },path.stats().rtt, path.stats().udp_rx.bytes, path.stats().udp_tx.bytes);
+
+                                       paths.push(info);
+                                    }
+
+                                    connections.insert(id, paths);
+                                    if streams.contains(&id){
+                                        continue;
+                                    }
+
+                                    streams.insert(id);
+                                    let mut stream = connection_info.paths().stream();
+                                    tasks.push(Box::pin(async move{(stream.next().await, id, stream)}));
+                                }
+                                peers_info.insert(*node_id, connections);
+                            }
+                            _ = app_sender.send(Message::Connections(peers_info)).await;
+                        }
+
+                        if tasks.is_empty(){
+                            _ = app_sender.send(Message::Connections(BTreeMap::default())).await;
+
+                            tokio::select! {
+                                _ = connections_receiver.recv() => {
+                                }
+                            }
+                        }else{
+                            let mut to_wait = futures_util::future::select_all(std::mem::take(&mut tasks));
+                            let _to_wait = std::pin::pin!(&mut to_wait);
+                            tokio::select! {
+                                _ = tokio::time::timeout(std::time::Duration::from_secs(1), connections_receiver.recv()) => {
+                                    tasks = to_wait.into_inner();
+                                }
+                                (result, _, remaining) = _to_wait => {
+                                    {
+                                        tasks.extend(remaining);
+                                        if result.0.is_some(){
+                                            let id = result.1;
+                                            let mut stream = result.2;
+                                            tasks.push(Box::pin(async move{(stream.next().await, id, stream)}));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                })));
+            }
+
+            let endpoint = iroh::Endpoint::builder().hooks(IrohHooks(connections.clone()))
+                .bind().await.unwrap();
 
             let store = iroh_blobs::store::mem::MemStore::new();
 
+            // let (sender, mut receiver) = iroh_blobs::provider::events::EventSender::channel(1, iroh_blobs::provider::events::EventMask{ connected: iroh_blobs::provider::events::ConnectMode::Notify, get: iroh_blobs::provider::events::RequestMode::NotifyLog, get_many: iroh_blobs::provider::events::RequestMode::NotifyLog, push: iroh_blobs::provider::events::RequestMode::NotifyLog, observe: iroh_blobs::provider::events::ObserveMode::Notify, throttle: iroh_blobs::provider::events::ThrottleMode::None});
+            // Box::leak(Box::new(tokio::spawn(async move{
+            //     while let Some(msg) = receiver.recv().await{
+            //         eprintln!("iroh-blobs event: {msg:?}");
+            //     }
+            // })));
+
+            // let blobs = iroh_blobs::BlobsProtocol::new(&store, Some(sender));
             let blobs = iroh_blobs::BlobsProtocol::new(&store, None);
 
             let node = iroh::protocol::RouterBuilder::new(endpoint)
@@ -2115,11 +2429,11 @@ fn main() {
                     WindowOptions {
                         window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds::centered(
                             None,
-                            gpui::size(scale(700f32).into(), scale(200f32).into()),
+                            gpui::size(700f32.into(), 300f32.into()),
                             cx,
                         ))),
                         window_decorations: Some(WindowDecorations::Client),
-                        window_min_size: Some(size(px(scale(350.)), px(scale(100.)))),
+                        window_min_size: Some(size(px(700.), px(300.))),
                         titlebar: Some(TitlebarOptions{title: Some("MuzzMan".into()), appears_transparent: true, traffic_light_position: None}),
                         window_background: gpui::WindowBackgroundAppearance::Opaque,
                         ..Default::default()
@@ -2134,7 +2448,7 @@ fn main() {
                                 focus_handle: text_input_cx.focus_handle(),
                                 content: SharedString::new(""),
                                 placeholder: SharedString::new(
-                                    "Get URL: sendme:6wsanfumhtkffsmsamckhbk2sruapvq6oi5rjso4t36ztthqas7a====",
+                                    "Get URL: sendme:blob54686973206973206e6f742061207265616c20636f6c6c656374696f6e",
                                 ),
                                 placeholder_color: rgb(0xadb5bd).into(),
                                 selected_range: 0..0,
@@ -2147,8 +2461,6 @@ fn main() {
                                 on_submit: Box::new(on_submit)
                             });
 
-                            let (sender, mut receiver) = tokio::sync::mpsc::channel::<Message>(1024);
-
                             cx.spawn(async move |this, cx|{
                                 while let Some(message) = receiver.recv().await{
                                     if let Some(app) = this.upgrade()
@@ -2160,7 +2472,7 @@ fn main() {
                             MuzzManApp {
                                 text_input,
                                 focus_handle: cx.focus_handle(),
-                                tree: cx.new(|_cx| Tree{ entries: vec![], all_entries: HashMap::default() } ),
+                                tree: cx.new(|cx| Tree{ entries: vec![Entry::Connections(cx.new(|cx|EntryConnections{entry_base: EntryBase::new(cx)}))], all_entries: HashMap::default() } ),
                                 settings: Settings {
                                     auto_collection: true,
                                     auto_download: false,
@@ -2225,13 +2537,9 @@ fn get_files(path: &Path) -> Vec<PathBuf> {
 
 fn format_bytes(bytes: u64) -> String {
     match bytes {
-        0..1000 => format!("{bytes}b"),
-        1000..1_000_000 => format!("{}Kb", bytes / 1000),
-        1_000_000..1_000_000_000 => format!("{}Mb", bytes / 1_000_000),
-        _ => format!("{}Gb", bytes / 1_000_000_000),
+        0..1024 => format!("{bytes}B"),
+        1024..1048576 => format!("{}KB", bytes >> 10),
+        1048576..1073741824 => format!("{}MB", bytes >> 20),
+        _ => format!("{}GB", bytes >> 30),
     }
-}
-
-const fn scale(input: f32) -> f32 {
-    input * 2.
 }
