@@ -2537,9 +2537,10 @@ fn get_files(path: &Path) -> Vec<PathBuf> {
 
 fn format_bytes(bytes: u64) -> String {
     match bytes {
-        0..1024 => format!("{bytes}B"),
-        1024..1048576 => format!("{}KB", bytes >> 10),
-        1048576..1073741824 => format!("{}MB", bytes >> 20),
-        _ => format!("{}GB", bytes >> 30),
+        0..2 => format!("{bytes} byte"),
+        2..1_000 => format!("{bytes} bytes"),
+        1_000..1_000_000 => format!("{}kB", bytes / 1_000),
+        1_000_000..1_000_000_000 => format!("{}MB", bytes / 1_000_000),
+        _ => format!("{}GB", bytes / 1_000_000_000),
     }
 }
