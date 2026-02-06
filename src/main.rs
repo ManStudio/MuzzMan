@@ -26,6 +26,7 @@ use blobsman_graphics::{
             blobs::{AddPathOptions, AddProgressItem},
             downloader::DownloadProgressItem,
         },
+        format::collection::CollectionMeta,
         hashseq::HashSeq,
         ticket::BlobTicket,
     },
@@ -88,6 +89,8 @@ const fn rgba(hex: u32) -> Rgba {
         a: (a as f32) / 255.,
     }
 }
+
+const VERSION: &str = "V0.1.0";
 
 const BLACK_1: Rgba = rgba(0x000000ff);
 const BLACK_2: Rgba = rgba(0x212121ff);
@@ -1002,13 +1005,6 @@ pub struct MuzzManApp {
     blob_info: HashMap<u64, (Hash, Vec<EndpointAddr>, u64)>,
 }
 
-/// The collection meta, stolen from iroh_blobs::format::collection
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-struct CollectionMeta {
-    header: [u8; 13], // Must contain "CollectionV0."
-    names: Vec<String>,
-}
-
 impl MuzzManApp {
     fn handle_url(&mut self, url: &str, cx: &mut Context<'_, MuzzManApp>) {
         let Some((protocol, url)) = url.split_once(':') else {
@@ -1079,7 +1075,7 @@ impl MuzzManApp {
                                         let collection_meta =
                                             postcard::from_bytes::<CollectionMeta>(&new_buffer)
                                                 .unwrap();
-                                        if &collection_meta.header != b"CollectionV0." {
+                                        if !collection_meta.check_header() {
                                             eprintln!("Is not a valid collection");
                                             return;
                                         }
@@ -1096,7 +1092,7 @@ impl MuzzManApp {
                                             .await
                                             .unwrap();
 
-                                        for name in collection_meta.names {
+                                        for name in collection_meta.names() {
                                             let hash = hashes_iterator.next().unwrap();
                                             let id = next_id();
 
@@ -1105,7 +1101,7 @@ impl MuzzManApp {
                                                     collection_id: Some(collection_id),
                                                     entry_id: id,
                                                     hash,
-                                                    name,
+                                                    name: name.to_owned(),
                                                     provider: ticket.addr().clone(),
                                                 })
                                                 .await
@@ -2253,7 +2249,7 @@ impl Render for MuzzManApp {
                             .text_color(WHITE)
                             .child("MuzzMan")
                             .text_size(px(32.))
-                            .child(div().child("V0").text_size(px(16.)))
+                            .child(div().child(VERSION).text_size(px(16.)))
                             .map(title_bar_zone),
                     )
                     .child(
