@@ -12,8 +12,8 @@ use blobsman_graphics::{
     futures_util::{self, StreamExt},
     gpui::{
         self, AnyElement, AssetSource, ClipboardItem, Div, EventEmitter, FutureExt,
-        PathPromptOptions, ScrollHandle, TitlebarOptions, WindowDecorations, anchored, deferred,
-        svg,
+        PathPromptOptions, Rgba, ScrollHandle, TitlebarOptions, WindowDecorations, anchored,
+        deferred, svg,
     },
     gpui_tokio,
     iroh::{
@@ -34,8 +34,7 @@ use blobsman_graphics::{
 use gpui::{
     App, AppContext, Bounds, CursorStyle, ElementId, Entity, ExternalPaths, FocusHandle,
     GlobalElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, ParentElement, Pixels,
-    Point, Render, SharedString, Style, Styled, Window, WindowOptions, div, prelude::*, px, rgb,
-    size,
+    Point, Render, SharedString, Style, Styled, Window, WindowOptions, div, prelude::*, px, size,
 };
 use serde::{Deserialize, Serialize};
 
@@ -79,6 +78,28 @@ impl AssetSource for Assets {
         Ok(vec![])
     }
 }
+
+const fn rgba(hex: u32) -> Rgba {
+    let [a, b, g, r] = hex.to_le_bytes();
+    Rgba {
+        r: (r as f32) / 255.,
+        g: (g as f32) / 255.,
+        b: (b as f32) / 255.,
+        a: (a as f32) / 255.,
+    }
+}
+
+const BLACK_1: Rgba = rgba(0x000000ff);
+const BLACK_2: Rgba = rgba(0x212121ff);
+const BLACK_3: Rgba = rgba(0x3a3a3aff);
+const BLACK_4: Rgba = rgba(0x484848ff);
+const BLACK_5: Rgba = rgba(0x505050ff);
+const DOWNLOAD: Rgba = rgba(0x2f7f1fff);
+const DOWNLOADING: Rgba = rgba(0x3f992dff);
+const PING: Rgba = rgba(0x43cc00ff);
+const UPLOAD: Rgba = rgba(0x2324b2ff);
+const UPLOADING: Rgba = rgba(0x1e61ccff);
+const WHITE: Rgba = rgba(0xffffffff);
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub fn next_id() -> u64 {
@@ -175,25 +196,7 @@ pub enum Entry {
     Collection(Entity<EntryCollection>),
 }
 
-struct DownloadPeerStatus {
-    total: u64,
-    speed: u64,
-    second_buffer: u64,
-    last_second: Instant,
-}
-
-#[derive(Default)]
-struct DownloadStatus {
-    peers: HashMap<PublicKey, DownloadPeerStatus>,
-    active: Option<PublicKey>,
-}
-
-struct UploadStatus {
-    total: usize,
-    speed: usize,
-}
-
-enum EntryStatus {
+enum BlobStatus {
     Importing {
         bytes: u64,
     },
@@ -202,60 +205,188 @@ enum EntryStatus {
     },
     Active {
         hash: Hash,
-        downloading: DownloadStatus,
-        uploading: HashMap<PublicKey, UploadStatus>,
-        exporting: HashMap<SharedString, u64>,
         current_size: u64,
         total_size: u64,
     },
 }
 
-impl EntryStatus {
+impl BlobStatus {
     pub fn hash(&self) -> Option<Hash> {
         match self {
-            EntryStatus::Importing { .. } => None,
-            EntryStatus::Known { hash } | EntryStatus::Active { hash, .. } => Some(*hash),
+            BlobStatus::Importing { .. } => None,
+            BlobStatus::Known { hash } | BlobStatus::Active { hash, .. } => Some(*hash),
         }
     }
 }
 
 pub struct EntryBlob {
     id: u64,
-    status: EntryStatus,
+    status: BlobStatus,
     name: SharedString,
 
-    entry_base: EntryBase<Infallible>,
+    base: EntryBase<EntryStatus>,
 }
 
-impl AsRef<EntryBase<Infallible>> for EntryBlob {
-    fn as_ref(&self) -> &EntryBase<Infallible> {
-        &self.entry_base
+#[derive(Clone)]
+pub enum EntryStatus {
+    Downloading(Entity<EntryStatusDownloading>),
+    Exporting(Entity<EntryStatusExporting>),
+}
+
+impl AsRef<EntryBase<EntryStatus>> for EntryBlob {
+    fn as_ref(&self) -> &EntryBase<EntryStatus> {
+        &self.base
     }
 }
 
-impl AsMut<EntryBase<Infallible>> for EntryBlob {
+impl AsMut<EntryBase<EntryStatus>> for EntryBlob {
+    fn as_mut(&mut self) -> &mut EntryBase<EntryStatus> {
+        &mut self.base
+    }
+}
+
+pub struct EntryStatusDownloadingPeer {
+    base: EntryBase<Infallible>,
+    public_key: PublicKey,
+    total: u64,
+    received: u64,
+    speed: u64,
+    second_received: u64,
+    last_second: Instant,
+}
+
+impl AsRef<EntryBase<Infallible>> for EntryStatusDownloadingPeer {
+    fn as_ref(&self) -> &EntryBase<Infallible> {
+        &self.base
+    }
+}
+
+impl AsMut<EntryBase<Infallible>> for EntryStatusDownloadingPeer {
     fn as_mut(&mut self) -> &mut EntryBase<Infallible> {
-        &mut self.entry_base
+        &mut self.base
+    }
+}
+
+impl Render for EntryStatusDownloadingPeer {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let downloading = div()
+            .text_color(DOWNLOADING)
+            .child(format!("{}/s", format_bytes(self.speed)));
+
+        let downloaded = div()
+            .text_color(DOWNLOAD)
+            .child(format_bytes(self.received));
+
+        let precent = div().text_color(WHITE).child(format!(
+            "{:0.2}%",
+            (self.received as f64 / self.total as f64) * 100.
+        ));
+
+        entry_base(
+            self,
+            self.public_key.to_string().into(),
+            |header, _| {
+                header
+                    .bg(BLACK_2)
+                    .child(downloading)
+                    .child(div().min_w(px(4.)))
+                    .child(downloaded)
+                    .child(div().min_w(px(4.)))
+                    .child(precent)
+            },
+            |_, _| unreachable!(),
+            |_| div().into_any_element(),
+            window,
+            cx,
+        )
+    }
+}
+
+pub struct EntryStatusDownloading {
+    base: EntryBase<Entity<EntryStatusDownloadingPeer>>,
+    active: Option<PublicKey>,
+}
+
+impl AsRef<EntryBase<Entity<EntryStatusDownloadingPeer>>> for EntryStatusDownloading {
+    fn as_ref(&self) -> &EntryBase<Entity<EntryStatusDownloadingPeer>> {
+        &self.base
+    }
+}
+
+impl AsMut<EntryBase<Entity<EntryStatusDownloadingPeer>>> for EntryStatusDownloading {
+    fn as_mut(&mut self) -> &mut EntryBase<Entity<EntryStatusDownloadingPeer>> {
+        &mut self.base
+    }
+}
+
+impl Render for EntryStatusDownloading {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        entry_base(
+            self,
+            SharedString::new_static("Downloading"),
+            |header, _| header,
+            |entry, _cx| entry.clone().into_any_element(),
+            |_| div().into_any_element(),
+            window,
+            cx,
+        )
+    }
+}
+
+pub struct EntryStatusExporting {
+    base: EntryBase<Infallible>,
+    path: String,
+    exported: u64,
+    total: u64,
+}
+
+impl Render for EntryStatusExporting {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let precent = div().text_color(WHITE).child(format!(
+            "{:0.2}",
+            (self.exported as f64 / self.total as f64) * 100.
+        ));
+
+        entry_base(
+            self,
+            format!("Exporting to: {}", self.path).into(),
+            |header, _| header.bg(BLACK_2).child(precent),
+            |_, _| unreachable!(),
+            |_| div().into_any_element(),
+            window,
+            cx,
+        )
+    }
+}
+
+impl AsRef<EntryBase<Infallible>> for EntryStatusExporting {
+    fn as_ref(&self) -> &EntryBase<Infallible> {
+        &self.base
+    }
+}
+
+impl AsMut<EntryBase<Infallible>> for EntryStatusExporting {
+    fn as_mut(&mut self) -> &mut EntryBase<Infallible> {
+        &mut self.base
     }
 }
 
 pub struct EntryCollection {
+    base: EntryBase<Entity<EntryBlob>>,
     id: u64,
     hash: Hash,
     name: SharedString,
-
-    entry_base: EntryBase<Entity<EntryBlob>>,
 }
 
 impl AsRef<EntryBase<Entity<EntryBlob>>> for EntryCollection {
     fn as_ref(&self) -> &EntryBase<Entity<EntryBlob>> {
-        &self.entry_base
+        &self.base
     }
 }
 
 impl AsMut<EntryBase<Entity<EntryBlob>>> for EntryCollection {
     fn as_mut(&mut self) -> &mut EntryBase<Entity<EntryBlob>> {
-        &mut self.entry_base
+        &mut self.base
     }
 }
 
@@ -285,10 +416,10 @@ impl<T> EntryBase<T> {
     }
 }
 
-fn entry_base<E, T: AsRef<EntryBase<E>> + AsMut<EntryBase<E>> + 'static>(
+fn entry_base<E: 'static, T: AsRef<EntryBase<E>> + AsMut<EntryBase<E>> + 'static>(
     entry_base: &mut T,
     name: SharedString,
-    header_buttons: impl FnOnce(&mut Context<T>) -> AnyElement,
+    header_buttons: impl FnOnce(Div, &mut Context<T>) -> Div,
     get_entry: impl Fn(&E, &mut Context<T>) -> AnyElement,
     context_menu: impl FnOnce(&mut Context<T>) -> AnyElement,
     _window: &mut Window,
@@ -300,7 +431,7 @@ fn entry_base<E, T: AsRef<EntryBase<E>> + AsMut<EntryBase<E>> + 'static>(
             .flex_col()
             .min_h(px(25.))
             .max_h(px(25.))
-            .bg(rgb(0x495057))
+            .bg(BLACK_4)
             .text_size(px(16.0))
             .id("entry")
             .child(TrackBounds {
@@ -313,45 +444,43 @@ fn entry_base<E, T: AsRef<EntryBase<E>> + AsMut<EntryBase<E>> + 'static>(
                     .min_h(px(25.))
                     .max_h(px(25.))
                     .items_center()
-                    .child(
-                        svg()
-                            .flex()
-                            .text_color(rgb(0xffffff))
-                            .path(SharedString::new_static(if entry_base.as_ref().expanded {
-                                "arrow_downward"
-                            } else {
-                                "arrow_right"
-                            }))
-                            .min_w(px(25.))
-                            .min_h(px(25.))
-                            .max_w(px(25.))
-                            .max_h(px(25.))
-                            .id("expand")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.as_mut().expanded = !this.as_ref().expanded;
-                                cx.notify();
-                            })),
+                    .when(
+                        std::any::TypeId::of::<E>() != std::any::TypeId::of::<Infallible>(),
+                        |this| {
+                            this.child(
+                                svg()
+                                    .flex()
+                                    .text_color(WHITE)
+                                    .path(SharedString::new_static(
+                                        if entry_base.as_ref().expanded {
+                                            "arrow_downward"
+                                        } else {
+                                            "arrow_right"
+                                        },
+                                    ))
+                                    .min_w(px(25.))
+                                    .min_h(px(25.))
+                                    .max_w(px(25.))
+                                    .max_h(px(25.))
+                                    .id("expand")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.as_mut().expanded = !this.as_ref().expanded;
+                                        cx.notify();
+                                    })),
+                            )
+                        },
                     )
                     .child(
                         div()
                             .flex()
                             .flex_row()
-                            .min_h(px(25.))
-                            .max_h(px(25.))
                             .id("header_name")
                             .overflow_scroll()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .min_h(px(25.))
-                                    .max_h(px(25.))
-                                    .items_center()
-                                    .child(name.clone()),
-                            ),
+                            .text_size(px(16.))
+                            .child(div().child(name.clone())),
                     )
                     .child(div().flex().flex_grow())
-                    .child(header_buttons(cx))
+                    .map(|this| header_buttons(this, cx))
                     .child(div().min_w(px(4.))),
             )
             .on_mouse_down(
@@ -370,12 +499,7 @@ fn entry_base<E, T: AsRef<EntryBase<E>> + AsMut<EntryBase<E>> + 'static>(
     ); // header
 
     if entry_base.as_ref().expanded && !entry_base.as_ref().entries.is_empty() {
-        let mut content = div()
-            .flex()
-            .flex_col()
-            .flex_grow()
-            .bg(rgb(0x212529))
-            .pb(px(4.));
+        let mut content = div().flex().flex_col().flex_grow().bg(BLACK_2).pb(px(4.));
 
         for entry in entry_base.as_ref().entries.iter() {
             content = content.child(
@@ -391,7 +515,7 @@ fn entry_base<E, T: AsRef<EntryBase<E>> + AsMut<EntryBase<E>> + 'static>(
         let outer_body = div().flex().flex_col().pl(px(11.)).child(
             div()
                 .flex()
-                .bg(rgb(0x495057))
+                .bg(BLACK_4)
                 .flex_col()
                 .child(div().flex().flex_col().child(content).pl(px(3.)).pb(px(3.))),
         );
@@ -417,13 +541,13 @@ fn entry_base<E, T: AsRef<EntryBase<E>> + AsMut<EntryBase<E>> + 'static>(
                     div()
                         .flex()
                         .flex_col()
-                        .bg(rgb(0x212121))
+                        .bg(BLACK_2)
                         .child(
                             div()
                                 .mb(px(2.))
                                 .ml(px(2.))
                                 .mr(px(2.))
-                                .bg(rgb(0x495057)) // 0x343a40
+                                .bg(BLACK_3)
                                 .text_size(px(16.))
                                 .child(context_menu(cx)),
                         )
@@ -438,24 +562,93 @@ fn entry_base<E, T: AsRef<EntryBase<E>> + AsMut<EntryBase<E>> + 'static>(
 }
 impl Render for EntryCollection {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let hash = self.hash;
+        let mut show_download = false;
+        let mut show_export = false;
+        let show_share = self.hash != Hash::EMPTY;
+
+        for entry in self.base.entries.iter() {
+            if let BlobStatus::Known { .. } = entry.read(cx).status {
+                show_download = true;
+            }
+
+            if let BlobStatus::Active {
+                total_size,
+                current_size,
+                ..
+            } = entry.read(cx).status
+                && current_size == total_size
+            {
+                show_export = true;
+            }
+        }
 
         entry_base(
             self,
             self.name.clone(),
-            move |cx| {
-                div()
-                    .when(hash != Hash::EMPTY, |this| {
+            move |header, cx| {
+                header.when(show_share, |this| {
+                    this.when(show_download, |this| {
                         this.child(
                             svg()
                                 .flex()
-                                .text_color(rgb(0xffffff))
-                                .path(SharedString::new_static("share"))
-                                .min_w(px(25.))
-                                .min_h(px(25.))
-                                .max_w(px(25.))
-                                .max_h(px(25.))
+                                .text_color(DOWNLOAD)
+                                .path(SharedString::new_static("download"))
+                                .min_w(px(28.))
+                                .min_h(px(28.))
+                                .max_w(px(28.))
+                                .max_h(px(28.))
+                                .id("download")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.emit(Event::StartDownload { entry_id: this.id });
+                                })),
+                        )
+                    })
+                    .when(show_export, |this| {
+                        this.child(
+                            svg()
+                                .flex()
+                                .text_color(WHITE)
+                                .path(SharedString::new_static("export"))
+                                .min_w(px(28.))
+                                .min_h(px(28.))
+                                .max_w(px(28.))
+                                .max_h(px(28.))
+                                .id("export")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.emit(Event::Export { entry_id: this.id });
+                                })),
+                        )
+                    })
+                    .child(
+                        svg()
+                            .flex()
+                            .text_color(WHITE)
+                            .path(SharedString::new_static("share"))
+                            .min_w(px(25.))
+                            .min_h(px(25.))
+                            .max_w(px(25.))
+                            .max_h(px(25.))
+                            .id("share")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.emit(Event::ShareCollection {
+                                    entry_id: this.id,
+                                    me: false,
+                                });
+                            })),
+                    )
+                })
+            },
+            |entry, _cx| entry.clone().into_any_element(),
+            move |cx| {
+                div()
+                    .when(show_share, |this| {
+                        this.child(
+                            div()
+                                .bg(BLACK_2)
+                                .mt(px(2.0))
+                                .child("Share")
                                 .id("share")
+                                .hover(|s| s.bg(BLACK_3))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     cx.emit(Event::ShareCollection {
                                         entry_id: this.id,
@@ -464,44 +657,19 @@ impl Render for EntryCollection {
                                 })),
                         )
                     })
-                    .into_any_element()
-            },
-            |entry, _cx| entry.clone().into_any_element(),
-            |cx| {
-                div()
-                    .child(
-                        div()
-                            .bg(rgb(0x212121))
-                            .mt(px(2.0))
-                            .child("Share")
-                            .id("share")
-                            .hover(|s| s.bg(rgb(0x2f2f2f)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                cx.emit(Event::ShareCollection {
-                                    entry_id: this.id,
-                                    me: false,
-                                });
-                            })),
-                    )
-                    .child(
-                        div()
-                            .bg(rgb(0x212121))
-                            .mt(px(2.0))
-                            .child("Export")
-                            .id("export")
-                            .hover(|s| s.bg(rgb(0x2f2f2f)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                cx.emit(Event::Export { entry_id: this.id })
-                            })),
-                    )
-                    .child(
-                        div()
-                            .bg(rgb(0x212121))
-                            .mt(px(2.0))
-                            .child("Remove")
-                            .id("remove")
-                            .hover(|s| s.bg(rgb(0x2f2f2f))),
-                    )
+                    .when(show_export, |this| {
+                        this.child(
+                            div()
+                                .bg(BLACK_2)
+                                .mt(px(2.0))
+                                .child("Export")
+                                .id("export")
+                                .hover(|s| s.bg(BLACK_3))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.emit(Event::Export { entry_id: this.id })
+                                })),
+                        )
+                    })
                     .into_any_element()
             },
             window,
@@ -514,20 +682,30 @@ impl EventEmitter<Event> for EntryBlob {}
 
 impl Render for EntryBlob {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let hash = self.status.hash();
+        let show_export = if let BlobStatus::Active {
+            current_size,
+            total_size,
+            ..
+        } = &self.status
+        {
+            current_size == total_size
+        } else {
+            false
+        };
+
         let header =
             match &self.status {
-                EntryStatus::Importing { bytes } => div()
-                    .text_color(rgb(0x00ff00))
+                BlobStatus::Importing { bytes } => div()
+                    .text_color(WHITE)
                     .text_size(px(16.))
                     .child(SharedString::from(format!(
                         "Importing: {}",
                         format_bytes(*bytes)
                     ))),
-                EntryStatus::Known { .. } => div().child(
+                BlobStatus::Known { .. } => div().child(
                     svg()
                         .flex()
-                        .text_color(rgb(0x00ff00))
+                        .text_color(DOWNLOAD)
                         .path(SharedString::new_static("download"))
                         .min_w(px(28.))
                         .min_h(px(28.))
@@ -538,99 +716,63 @@ impl Render for EntryBlob {
                             cx.emit(Event::StartDownload { entry_id: this.id });
                         })),
                 ),
-                EntryStatus::Active {
+                BlobStatus::Active {
                     total_size,
                     current_size,
                     ..
-                } => div()
-                    .flex()
-                    .flex_row()
-                    .when(total_size != current_size, |this| {
-                        this.child(div().text_color(rgb(0x00ff00)).text_size(px(16.)).child(
-                            format!(
-                                "{:0.2}%",
-                                (*current_size as f32 / *total_size as f32) * 100.
-                            ),
-                        ))
-                    })
-                    .when(total_size == current_size, |this| {
-                        this.child(
-                            svg()
-                                .flex()
-                                .text_color(rgb(0xffffff))
-                                .path(SharedString::new_static("export"))
-                                .min_w(px(28.))
-                                .min_h(px(28.))
-                                .max_w(px(28.))
-                                .max_h(px(28.))
-                                .id("export")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    cx.emit(Event::Export { entry_id: this.id });
-                                })),
-                        )
-                    })
-                    .when(hash.unwrap_or(Hash::EMPTY) != Hash::EMPTY, |this| {
-                        this.child(
-                            svg()
-                                .flex()
-                                .text_color(rgb(0xffffff))
-                                .path(SharedString::new_static("share"))
-                                .min_w(px(28.))
-                                .min_h(px(28.))
-                                .max_w(px(28.))
-                                .max_h(px(28.))
-                                .id("share")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    cx.emit(Event::Share {
-                                        entry_id: this.id,
-                                        me: false,
-                                    });
-                                })),
-                        )
-                    }),
+                } => {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .when(total_size != current_size, |this| {
+                            this.child(div().text_color(DOWNLOADING).text_size(px(16.)).child(
+                                format!(
+                                    "{:0.2}%",
+                                    (*current_size as f64 / *total_size as f64) * 100.
+                                ),
+                            ))
+                        })
+                        .when(show_export, |this| {
+                            this.child(
+                                svg()
+                                    .flex()
+                                    .text_color(WHITE)
+                                    .path(SharedString::new_static("export"))
+                                    .min_w(px(28.))
+                                    .min_h(px(28.))
+                                    .max_w(px(28.))
+                                    .max_h(px(28.))
+                                    .id("export")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.emit(Event::Export { entry_id: this.id });
+                                    })),
+                            )
+                        })
+                }
             };
         entry_base(
             self,
             self.name.clone(),
-            move |_cx| header.into_any_element(),
-            |entry, _cx| div().into_any_element(),
+            move |h, _cx| h.child(header),
+            |entry, _cx| match entry.clone() {
+                EntryStatus::Downloading(e) => e.into_any_element(),
+                EntryStatus::Exporting(e) => e.into_any_element(),
+            },
             move |cx| {
                 div()
-                    .when(hash.is_some(), |this| {
+                    .when(show_export, |this| {
                         this.child(
                             div()
-                                .bg(rgb(0x212121))
+                                .bg(BLACK_2)
                                 .mt(px(2.0))
-                                .child("Share")
-                                .id("share")
-                                .hover(|s| s.bg(rgb(0x2f2f2f)))
+                                .child("Export")
+                                .id("export")
+                                .hover(|s| s.bg(BLACK_3))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    cx.emit(Event::Share {
-                                        entry_id: this.id,
-                                        me: false,
-                                    });
+                                    cx.emit(Event::Export { entry_id: this.id })
                                 })),
                         )
                     })
-                    .child(
-                        div()
-                            .bg(rgb(0x212121))
-                            .mt(px(2.0))
-                            .child("Export")
-                            .id("export")
-                            .hover(|s| s.bg(rgb(0x2f2f2f)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                cx.emit(Event::Export { entry_id: this.id })
-                            })),
-                    )
-                    .child(
-                        div()
-                            .bg(rgb(0x212121))
-                            .mt(px(2.0))
-                            .child("Remove")
-                            .id("remove")
-                            .hover(|s| s.bg(rgb(0x2f2f2f))),
-                    )
                     .into_any_element()
             },
             window,
@@ -660,7 +802,7 @@ impl Render for EntryConnections {
         entry_base(
             self,
             SharedString::new_static("Connections"),
-            |_| div().into_any_element(),
+            |h, _| h,
             |entry, _| entry.clone().into_any_element(),
             |_| div().into_any_element(),
             window,
@@ -670,19 +812,19 @@ impl Render for EntryConnections {
 }
 
 pub struct EntryConnection {
-    entry_base: EntryBase<Entity<EntryConnectionStats>>,
+    base: EntryBase<Entity<EntryConnectionStats>>,
     name: SharedString,
 }
 
 impl AsRef<EntryBase<Entity<EntryConnectionStats>>> for EntryConnection {
     fn as_ref(&self) -> &EntryBase<Entity<EntryConnectionStats>> {
-        &self.entry_base
+        &self.base
     }
 }
 
 impl AsMut<EntryBase<Entity<EntryConnectionStats>>> for EntryConnection {
     fn as_mut(&mut self) -> &mut EntryBase<Entity<EntryConnectionStats>> {
-        &mut self.entry_base
+        &mut self.base
     }
 }
 
@@ -691,7 +833,7 @@ impl Render for EntryConnection {
         entry_base(
             self,
             self.name.clone(),
-            |_| div().into_any_element(),
+            |h, _| h,
             |entry, _| entry.clone().into_any_element(),
             |_| div().into_any_element(),
             window,
@@ -701,7 +843,7 @@ impl Render for EntryConnection {
 }
 
 pub struct EntryConnectionStats {
-    entry_base: EntryBase<Infallible>,
+    base: EntryBase<Infallible>,
     name: SharedString,
     ping: Duration,
     download_total: u64,
@@ -710,13 +852,13 @@ pub struct EntryConnectionStats {
 
 impl AsRef<EntryBase<Infallible>> for EntryConnectionStats {
     fn as_ref(&self) -> &EntryBase<Infallible> {
-        &self.entry_base
+        &self.base
     }
 }
 
 impl AsMut<EntryBase<Infallible>> for EntryConnectionStats {
     fn as_mut(&mut self) -> &mut EntryBase<Infallible> {
-        &mut self.entry_base
+        &mut self.base
     }
 }
 
@@ -728,19 +870,19 @@ impl Render for EntryConnectionStats {
             .text_size(px(14.))
             .child(
                 div()
-                    .text_color(rgb(0x00ff00))
+                    .text_color(DOWNLOADING)
                     .child(format_bytes(self.download_total)),
             )
             .child(div().min_w(px(4.)))
             .child(
                 div()
-                    .text_color(rgb(0x2080ff))
+                    .text_color(UPLOADING)
                     .child(format_bytes(self.upload_total)),
             )
             .child(div().min_w(px(4.)))
             .child(
                 div()
-                    .text_color(rgb(0x00ff00))
+                    .text_color(PING)
                     .child(format!("{}ms", self.ping.as_millis())),
             );
 
@@ -749,9 +891,9 @@ impl Render for EntryConnectionStats {
         entry_base(
             self,
             self.name.clone(),
-            |_| header_buttons.into_any_element(),
+            |header, _| header.bg(BLACK_2).child(header_buttons),
             |_, _| div().into_any_element(),
-            |cx| context_menu.into_any_element(),
+            |_| context_menu.into_any_element(),
             window,
             cx,
         )
@@ -842,7 +984,6 @@ pub enum Message {
 #[derive(Debug, Clone)]
 pub enum Event {
     ShareCollection { entry_id: u64, me: bool },
-    Share { entry_id: u64, me: bool },
     StartDownload { entry_id: u64 },
     Export { entry_id: u64 },
 }
@@ -912,7 +1053,6 @@ impl MuzzManApp {
                                         let mut hashes = Vec::<u8>::with_capacity(1024);
                                         reader.read_to_end(&mut hashes).await.unwrap();
                                         let hashes = HashSeq::new(hashes.into()).unwrap();
-                                        dbg!(&hashes);
                                         let mut hashes_iterator = hashes.iter();
 
                                         let Some(meta_hash) = hashes_iterator.next() else {
@@ -922,25 +1062,23 @@ impl MuzzManApp {
                                             return;
                                         };
 
-                                        dbg!(
-                                            downloader
-                                                .download(
-                                                    HashAndFormat::raw(meta_hash),
-                                                    [ticket.addr().id]
-                                                )
-                                                .await
-                                        );
+                                        if let Err(err) = downloader
+                                            .download(
+                                                HashAndFormat::raw(meta_hash),
+                                                [ticket.addr().id],
+                                            )
+                                            .await
+                                        {
+                                            eprintln!("Cannot download: {ticket}, Error {err}");
+                                        };
 
                                         let mut new_buffer = Vec::<u8>::with_capacity(1024);
                                         let mut reader = blobs.blobs().reader(meta_hash);
                                         reader.read_to_end(&mut new_buffer).await.unwrap();
-                                        dbg!(new_buffer.len());
 
                                         let collection_meta =
-                                            dbg!(postcard::from_bytes::<CollectionMeta>(
-                                                &new_buffer
-                                            ))
-                                            .unwrap();
+                                            postcard::from_bytes::<CollectionMeta>(&new_buffer)
+                                                .unwrap();
                                         if &collection_meta.header != b"CollectionV0." {
                                             eprintln!("Is not a valid collection");
                                             return;
@@ -1004,15 +1142,11 @@ impl MuzzManApp {
                         let Some(entry) = tree.all_entries.get(&entry_id) else {
                             return;
                         };
-                        match entry {
-                            Entry::Blob(entry) => {
-                                entry.update(cx, |entry, cx| {
-                                    entry.status = EntryStatus::Importing { bytes: progress };
-                                    cx.notify();
-                                });
-                            }
-                            Entry::Collection(_) => {}
-                            Entry::Connections(entity) => {}
+                        if let Entry::Blob(entry) = entry {
+                            entry.update(cx, |entry, cx| {
+                                entry.status = BlobStatus::Importing { bytes: progress };
+                                cx.notify();
+                            });
                         }
                     });
                 }
@@ -1029,29 +1163,21 @@ impl MuzzManApp {
                             return;
                         };
 
-                        match entry {
-                            Entry::Blob(entry) => {
-                                entry.update(cx, |entry, cx| {
-                                    let bytes =
-                                        if let EntryStatus::Importing { bytes } = entry.status {
-                                            bytes
-                                        } else {
-                                            0
-                                        };
+                        if let Entry::Blob(entry) = entry {
+                            entry.update(cx, |entry, cx| {
+                                let bytes = if let BlobStatus::Importing { bytes } = entry.status {
+                                    bytes
+                                } else {
+                                    0
+                                };
 
-                                    entry.status = EntryStatus::Active {
-                                        hash: temp_tag.hash(),
-                                        downloading: Default::default(),
-                                        uploading: HashMap::default(),
-                                        total_size: bytes,
-                                        current_size: bytes,
-                                        exporting: HashMap::default(),
-                                    };
-                                    cx.notify();
-                                });
-                            }
-                            Entry::Collection(_) => {}
-                            Entry::Connections(entity) => {}
+                                entry.status = BlobStatus::Active {
+                                    hash: temp_tag.hash(),
+                                    total_size: bytes,
+                                    current_size: bytes,
+                                };
+                                cx.notify();
+                            });
                         }
                     });
 
@@ -1124,7 +1250,7 @@ impl MuzzManApp {
                         id: entry_id,
                         hash,
                         name: name.into(),
-                        entry_base: EntryBase {
+                        base: EntryBase {
                             entries: Vec::default(),
                             expanded: false,
                             show_context_menu: false,
@@ -1178,9 +1304,9 @@ impl MuzzManApp {
                                 .detach();
                                 EntryBlob {
                                     id: entry_id,
-                                    status: EntryStatus::Known { hash },
+                                    status: BlobStatus::Known { hash },
                                     name: name.into(),
-                                    entry_base: EntryBase {
+                                    base: EntryBase {
                                         entries: Vec::default(),
                                         expanded: false,
                                         show_context_menu: false,
@@ -1206,9 +1332,9 @@ impl MuzzManApp {
 
                             EntryBlob {
                                 id: entry_id,
-                                status: EntryStatus::Known { hash },
+                                status: BlobStatus::Known { hash },
                                 name: name.into(),
-                                entry_base: EntryBase {
+                                base: EntryBase {
                                     entries: Vec::default(),
                                     expanded: false,
                                     show_context_menu: false,
@@ -1228,82 +1354,113 @@ impl MuzzManApp {
                 });
             }
             Message::Event(Event::StartDownload { entry_id }) => {
-                let Some(info) = self.blob_info.get(&entry_id) else {
-                    eprintln!("Cannot get info for: {entry_id}");
-                    return;
-                };
-
-                let node = self.node.clone();
-                let blobs = self.blobs.clone();
-                let hash = info.0;
-                let mut providers = info.1.clone();
-                let sender = self.sender.clone();
+                let mut to_download = Vec::default();
 
                 self.tree.update(cx, |tree, cx| {
                     let entry = tree.all_entries.get(&entry_id).unwrap();
 
-                    if let Entry::Blob(entity) = entry {
-                        entity.update(cx, |entry, cx| {
-                            entry.status = EntryStatus::Active {
-                                hash,
-                                downloading: Default::default(),
-                                uploading: HashMap::default(),
-                                total_size: u64::MAX,
-                                current_size: 0,
-                                exporting: HashMap::default(),
-                            };
+                    match entry {
+                        Entry::Blob(entity) => {
+                            entity.update(cx, |entry, cx| {
+                                if let BlobStatus::Known { hash, .. } = entry.status {
+                                    let Some(info) = self.blob_info.get(&entry.id) else {
+                                        eprintln!("Cannot get info for: {}", entry.id);
+                                        return;
+                                    };
 
-                            if self.settings.auto_expand {
-                                entry.as_mut().expanded = true;
-                                cx.notify();
+                                    to_download.push((info.0, info.1.clone(), entry.id));
+
+                                    entry.status = BlobStatus::Active {
+                                        hash,
+                                        total_size: u64::MAX,
+                                        current_size: 0,
+                                    };
+
+                                    if self.settings.auto_expand {
+                                        entry.as_mut().expanded = true;
+                                        cx.notify();
+                                    }
+                                }
+                            });
+                        }
+                        Entry::Collection(entity) => entity.update(cx, |collection, cx| {
+                            for entity in collection.base.entries.iter() {
+                                entity.update(cx, |entry, cx| {
+                                    if let BlobStatus::Known { hash, .. } = entry.status {
+                                        let Some(info) = self.blob_info.get(&entry.id) else {
+                                            eprintln!("Cannot get info for: {}", entry.id);
+                                            return;
+                                        };
+
+                                        to_download.push((info.0, info.1.clone(), entry.id));
+
+                                        entry.status = BlobStatus::Active {
+                                            hash,
+                                            total_size: u64::MAX,
+                                            current_size: 0,
+                                        };
+
+                                        if self.settings.auto_expand {
+                                            entry.as_mut().expanded = true;
+                                            cx.notify();
+                                        }
+                                    }
+                                });
                             }
-                        });
+                        }),
+                        _ => {}
                     }
                 });
 
-                gpui_tokio::Tokio::spawn(cx, async move {
-                    let mut stats = None;
+                for (hash, providers, entry_id) in to_download {
+                    let node = self.node.clone();
+                    let blobs = self.blobs.clone();
+                    let sender = self.sender.clone();
 
-                    for provider in providers.iter() {
-                        match node
-                            .endpoint()
-                            .connect(provider.clone(), iroh_blobs::ALPN)
-                            .await
-                        {
-                            Err(err) => eprintln!("Cannot connect to: {} {err}", provider.id),
-                            Ok(connection) => {
-                                if let Ok(res) = iroh_blobs::get::request::get_unverified_size(
-                                    &connection,
-                                    &hash,
-                                )
+                    gpui_tokio::Tokio::spawn(cx, async move {
+                        let mut stats = None;
+
+                        for provider in providers.iter() {
+                            match node
+                                .endpoint()
+                                .connect(provider.clone(), iroh_blobs::ALPN)
                                 .await
-                                {
-                                    stats = Some(res);
+                            {
+                                Err(err) => eprintln!("Cannot connect to: {} {err}", provider.id),
+                                Ok(connection) => {
+                                    if let Ok(res) = iroh_blobs::get::request::get_unverified_size(
+                                        &connection,
+                                        &hash,
+                                    )
+                                    .await
+                                    {
+                                        stats = Some(res);
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    let downloader = blobs.downloader(node.endpoint());
+                        let downloader = blobs.downloader(node.endpoint());
 
-                    let progress = downloader.download(
-                        HashAndFormat::raw(hash),
-                        providers.iter().map(|p| p.id).collect::<Vec<_>>(),
-                    );
+                        let progress = downloader.download(
+                            HashAndFormat::raw(hash),
+                            providers.iter().map(|p| p.id).collect::<Vec<_>>(),
+                        );
 
-                    let mut stream = progress.stream().await.unwrap();
+                        let mut stream = progress.stream().await.unwrap();
 
-                    while let Some(progress) = stream.next().await {
-                        _ = sender
-                            .send(Message::DownloadProgress {
-                                entry_id,
-                                progress,
-                                max_size: stats.as_ref().map(|s| s.0).unwrap_or_default(),
-                            })
-                            .await;
-                    }
-                })
-                .detach();
+                        while let Some(progress) = stream.next().await {
+                            _ = sender
+                                .send(Message::DownloadProgress {
+                                    entry_id,
+                                    progress,
+                                    max_size: stats.as_ref().map(|s| s.0).unwrap_or_default(),
+                                })
+                                .await;
+                        }
+                    })
+                    .detach();
+                }
             }
             Message::DownloadProgress {
                 entry_id,
@@ -1311,70 +1468,138 @@ impl MuzzManApp {
                 max_size,
             } => {
                 self.tree.update(cx, |tree, cx| {
-                    match tree.all_entries.get(&entry_id).unwrap() {
-                        Entry::Blob(entry) => {
-                            entry.update(cx, |entry, cx| {
-                                let EntryBlob {
-                                    status:
-                                        EntryStatus::Active {
-                                            hash,
-                                            downloading,
-                                            total_size,
-                                            current_size,
-                                            ..
-                                        },
-                                    entry_base: EntryBase { expanded, .. },
-                                    ..
-                                } = entry
-                                else {
-                                    return;
-                                };
+                    if let Entry::Blob(entry) = tree.all_entries.get(&entry_id).unwrap() {
+                        entry.update(cx, |entry, cx| {
+                            let EntryBlob {
+                                status:
+                                    BlobStatus::Active {
+                                        hash,
+                                        total_size,
+                                        current_size,
+                                        ..
+                                    },
+                                base:
+                                    EntryBase {
+                                        expanded, entries, ..
+                                    },
+                                ..
+                            } = entry
+                            else {
+                                return;
+                            };
 
-                                match progress {
-                                    DownloadProgressItem::Error(error) => {}
-                                    DownloadProgressItem::TryProvider { id, request } => {
-                                        assert_eq!(request.hash, *hash);
+                            match progress {
+                                DownloadProgressItem::Error(err) => {
+                                    eprintln!("Download error for {hash}: {err}");
 
-                                        downloading.peers.entry(id).or_insert(DownloadPeerStatus {
-                                            total: 0,
-                                            speed: 0,
-                                            second_buffer: 0,
-                                            last_second: Instant::now(),
-                                        });
+                                    entries.retain(|entry| {
+                                        !matches!(entry, EntryStatus::Downloading(_))
+                                    });
+
+                                    entry.status = BlobStatus::Known { hash: *hash };
+                                }
+                                DownloadProgressItem::DownloadError => {
+                                    eprintln!("Download error for {hash}: Unknown");
+
+                                    entries.retain(|entry| {
+                                        !matches!(entry, EntryStatus::Downloading(_))
+                                    });
+
+                                    entry.status = BlobStatus::Known { hash: *hash };
+                                }
+                                DownloadProgressItem::TryProvider { id, request } => {
+                                    assert_eq!(request.hash, *hash);
+
+                                    let EntryStatus::Downloading(downloading) = entries
+                                        .iter()
+                                        .find(|&entry| matches!(entry, EntryStatus::Downloading(_)))
+                                        .cloned()
+                                        .unwrap_or_else(|| {
+                                            entries.push(EntryStatus::Downloading(cx.new(|cx| {
+                                                EntryStatusDownloading {
+                                                    base: EntryBase::new(cx),
+                                                    active: None,
+                                                }
+                                            })));
+                                            entries.last().unwrap().clone()
+                                        })
+                                    else {
+                                        unreachable!()
+                                    };
+
+                                    downloading.update(cx, |downloading, cx| {
+                                        downloading.base.entries.push(cx.new(|cx| {
+                                            EntryStatusDownloadingPeer {
+                                                public_key: id,
+                                                base: EntryBase::new(cx),
+                                                total: *total_size,
+                                                received: 0,
+                                                speed: 0,
+                                                second_received: 0,
+                                                last_second: Instant::now(),
+                                            }
+                                        }));
 
                                         downloading.active = Some(id);
-                                    }
-                                    DownloadProgressItem::ProviderFailed { .. } => {}
-                                    DownloadProgressItem::PartComplete { .. } => {
-                                        downloading.active = None;
-                                    }
-                                    DownloadProgressItem::Progress(bytes) => {
-                                        *current_size = bytes;
-                                        *total_size = max_size;
+                                    });
 
+                                    if *expanded {
+                                        cx.notify();
+                                    }
+                                }
+                                DownloadProgressItem::ProviderFailed { .. } => {}
+                                DownloadProgressItem::PartComplete { .. } => {
+                                    entries.retain(|entry| {
+                                        !matches!(entry, EntryStatus::Downloading(_))
+                                    });
+
+                                    if *expanded {
+                                        cx.notify();
+                                    }
+                                }
+                                DownloadProgressItem::Progress(bytes) => {
+                                    *current_size = bytes;
+                                    *total_size = max_size;
+
+                                    let EntryStatus::Downloading(downloading) = entries
+                                        .iter()
+                                        .find(|entry| matches!(entry, EntryStatus::Downloading(_)))
+                                        .unwrap()
+                                    else {
+                                        unreachable!()
+                                    };
+
+                                    downloading.update(cx, |downloading, cx| {
                                         if let Some(id) = downloading.active {
-                                            let stats = downloading.peers.get_mut(&id).unwrap();
-                                            stats.second_buffer += bytes - stats.total;
-                                            stats.total = bytes;
+                                            let entry = downloading
+                                                .base
+                                                .entries
+                                                .iter()
+                                                .find(|entry| entry.read(cx).public_key == id)
+                                                .unwrap();
 
-                                            if stats.last_second.elapsed() >= Duration::from_secs(1)
-                                            {
-                                                stats.speed = stats.second_buffer;
-                                                stats.second_buffer = 0;
-                                                stats.last_second = Instant::now();
-                                            }
+                                            entry.update(cx, |stats, _| {
+                                                stats.second_received += bytes - stats.received;
+                                                stats.received = bytes;
+                                                stats.total = *total_size;
+
+                                                if stats.last_second.elapsed()
+                                                    >= Duration::from_secs(1)
+                                                {
+                                                    stats.speed = stats.second_received;
+                                                    stats.second_received = 0;
+                                                    stats.last_second = Instant::now();
+                                                }
+                                            })
                                         }
 
                                         if *expanded {
                                             cx.notify();
                                         }
-                                    }
-                                    DownloadProgressItem::DownloadError => {}
+                                    });
                                 }
-                            });
-                        }
-                        Entry::Collection(_) => {}
-                        Entry::Connections(entity) => {}
+                            }
+                        });
                     }
                 });
             }
@@ -1406,42 +1631,6 @@ impl MuzzManApp {
                     );
 
                     write_to_clipboard(cx, ClipboardItem::new_string(format!("sendme:{ticket}")));
-                }
-            }
-            Message::Event(Event::Share { entry_id, me }) => {
-                if me {
-                    let Some(info) = self.blob_info.get(&entry_id) else {
-                        unreachable!()
-                    };
-
-                    let ticket = BlobTicket::new(
-                        self.node.endpoint().addr(),
-                        info.0,
-                        iroh_blobs::BlobFormat::HashSeq,
-                    );
-
-                    write_to_clipboard(
-                        cx,
-                        ClipboardItem::new_string(format!("iroh_blob:{ticket}")),
-                    );
-                } else {
-                    let Some(info) = self.blob_info.get(&entry_id) else {
-                        unreachable!()
-                    };
-
-                    let ticket = BlobTicket::new(
-                        info.1
-                            .first()
-                            .cloned()
-                            .unwrap_or_else(|| self.node.endpoint().addr()),
-                        info.0,
-                        iroh_blobs::BlobFormat::HashSeq,
-                    );
-
-                    write_to_clipboard(
-                        cx,
-                        ClipboardItem::new_string(format!("iroh_blob:{ticket}")),
-                    );
                 }
             }
             Message::SetCollectionHash { entry_id, hash } => {
@@ -1486,7 +1675,7 @@ impl MuzzManApp {
                         let sender = self.sender.clone();
                         let entry_id = blob.id;
                         let total_size = match blob.status {
-                            EntryStatus::Active { total_size, .. } => total_size,
+                            BlobStatus::Active { total_size, .. } => total_size,
                             _ => return,
                         };
                         cx.spawn(async move |_, cx| {
@@ -1503,10 +1692,10 @@ impl MuzzManApp {
                                     match progress{
                                         iroh_blobs::api::blobs::ExportProgressItem::Size(_) => {},
                                         iroh_blobs::api::blobs::ExportProgressItem::CopyProgress(size) => {
-                                            sender.send(Message::ExportProgress { entry_id, path: path.clone(), size }).await;
+                                            _ = sender.send(Message::ExportProgress { entry_id, path: path.clone(), size }).await;
                                         },
                                         iroh_blobs::api::blobs::ExportProgressItem::Done => {
-                                            sender.send(Message::ExportProgress { entry_id, path: path.clone(), size: total_size }).await;
+                                            _ = sender.send(Message::ExportProgress { entry_id, path: path.clone(), size: total_size }).await;
                                         },
                                         iroh_blobs::api::blobs::ExportProgressItem::Error(error) => {
                                             println!("Export error: {error}");
@@ -1558,7 +1747,7 @@ impl MuzzManApp {
                                 return;
                             };
 
-                            let Some(root_path) = path.get(0) else {
+                            let Some(root_path) = path.first() else {
                                 return;
                             };
 
@@ -1576,7 +1765,7 @@ impl MuzzManApp {
 
                                 println!("{hash}: {path:?}");
 
-                                _ = gpui_tokio::Tokio::spawn(cx, async move {
+                                gpui_tokio::Tokio::spawn(cx, async move {
                                     match blobs.export(hash, &path).await {
                                         Ok(size) => {
                                             println!(
@@ -1596,7 +1785,7 @@ impl MuzzManApp {
                         })
                         .detach();
                     }
-                    Entry::Connections(entity) => {}
+                    _ => {}
                 }
             }
             Message::ExportProgress {
@@ -1610,12 +1799,53 @@ impl MuzzManApp {
                 };
 
                 blob.update(cx, |blob, cx| {
-                    let EntryStatus::Active { exporting, .. } = &mut blob.status else {
+                    let BlobStatus::Active { total_size, .. } = &mut blob.status else {
                         return;
                     };
 
-                    let progress = exporting.entry(path).or_default();
-                    *progress = size;
+                    if size == *total_size {
+                        blob.base.entries.retain(|e| {
+                            if let EntryStatus::Exporting(e) = e {
+                                e.read(cx).path != path
+                            } else {
+                                true
+                            }
+                        });
+
+                        cx.notify();
+                        return;
+                    }
+
+                    let EntryStatus::Exporting(exporting) = blob
+                        .base
+                        .entries
+                        .iter()
+                        .find(|e| {
+                            if let EntryStatus::Exporting(e) = e {
+                                e.read(cx).path == path
+                            } else {
+                                false
+                            }
+                        })
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            blob.base.entries.push(EntryStatus::Exporting(cx.new(|cx| {
+                                EntryStatusExporting {
+                                    base: EntryBase::new(cx),
+                                    path: path.to_string(),
+                                    exported: 0,
+                                    total: *total_size,
+                                }
+                            })));
+                            blob.base.entries.last().unwrap().clone()
+                        })
+                    else {
+                        unreachable!()
+                    };
+
+                    exporting.update(cx, |exporting, _| {
+                        exporting.exported = size;
+                    });
 
                     if blob.as_ref().expanded {
                         cx.notify();
@@ -1650,7 +1880,7 @@ impl MuzzManApp {
                             let mut peer_info = peers_info.remove(&peer_id).unwrap();
 
                             peer_entry.as_mut().entries.retain(|connections_entry| {
-                                connections_entry.update(cx, |connection, cx| {
+                                connections_entry.update(cx, |connection, _cx| {
                                     let mut peer_info_uid = None;
                                     let mut peer_info_idx = None;
 
@@ -1682,7 +1912,6 @@ impl MuzzManApp {
                                     connection.ping = route.1;
                                     connection.download_total = route.2;
                                     connection.upload_total = route.3;
-                                    cx.notify();
                                     true
                                 })
                             });
@@ -1691,14 +1920,13 @@ impl MuzzManApp {
                                 for peer_info in peer_info {
                                     peer_entry.as_mut().entries.push(cx.new(|cx| {
                                         EntryConnectionStats {
-                                            entry_base: EntryBase::new(cx),
+                                            base: EntryBase::new(cx),
                                             name: peer_info.0.clone(),
                                             ping: peer_info.1,
                                             download_total: peer_info.2,
                                             upload_total: peer_info.3,
                                         }
                                     }));
-                                    cx.notify();
                                 }
                             }
 
@@ -1709,14 +1937,14 @@ impl MuzzManApp {
                     for (peer_id, peer_info) in peers_info.iter() {
                         connections.as_mut().entries.push(cx.new(move |cx| {
                             let mut peer_entry = EntryConnection {
-                                entry_base: EntryBase::new(cx),
+                                base: EntryBase::new(cx),
                                 name: peer_id.to_string().into(),
                             };
                             for peer_info in peer_info.values() {
                                 for peer_info in peer_info {
                                     peer_entry.as_mut().entries.push(cx.new(|cx| {
                                         EntryConnectionStats {
-                                            entry_base: EntryBase::new(cx),
+                                            base: EntryBase::new(cx),
                                             name: peer_info.0.clone(),
                                             ping: peer_info.1,
                                             download_total: peer_info.2,
@@ -1727,9 +1955,9 @@ impl MuzzManApp {
                             }
                             peer_entry
                         }));
-                        cx.notify();
                     }
                 });
+                cx.notify();
             }
         }
     }
@@ -1830,10 +2058,10 @@ impl MuzzManApp {
                         })
                         .detach();
                         EntryBlob {
-                            status: EntryStatus::Importing { bytes: 0 },
+                            status: BlobStatus::Importing { bytes: 0 },
                             id,
                             name,
-                            entry_base: EntryBase {
+                            base: EntryBase {
                                 entries: Vec::default(),
                                 expanded: false,
                                 show_context_menu: false,
@@ -1871,7 +2099,7 @@ impl MuzzManApp {
                         id: collection_id,
                         hash: Hash::EMPTY,
                         name,
-                        entry_base: EntryBase {
+                        base: EntryBase {
                             entries,
                             expanded: false,
                             show_context_menu: false,
@@ -1932,10 +2160,10 @@ impl MuzzManApp {
                     })
                     .detach();
                     EntryBlob {
-                        status: EntryStatus::Importing { bytes: 0 },
+                        status: BlobStatus::Importing { bytes: 0 },
                         id,
                         name,
-                        entry_base: EntryBase {
+                        base: EntryBase {
                             entries: Vec::default(),
                             expanded: false,
                             show_context_menu: false,
@@ -1966,7 +2194,9 @@ fn write_to_clipboard(cx: &mut App, item: ClipboardItem) {
             cx.update(|cx| {
                 if cx.read_from_clipboard().as_ref() == Some(&item) {
                     written = true;
+                    println!("Succesfult written to the clipboard");
                 } else {
+                    println!("Try to write to the clipboard");
                     cx.write_to_clipboard(item.clone());
                 }
             });
@@ -1983,7 +2213,7 @@ impl Render for MuzzManApp {
     fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
-            .bg(gpui::rgb(0x343a40))
+            .bg(BLACK_3)
             .flex()
             .flex_col()
             .font_family("Roboto Mono")
@@ -2002,7 +2232,7 @@ impl Render for MuzzManApp {
             }))
             .child(
                 div()
-                    .bg(rgb(0x212529))
+                    .bg(BLACK_2)
                     .min_h(px(42.0))
                     .max_h(px(42.0))
                     .flex()
@@ -2020,7 +2250,7 @@ impl Render for MuzzManApp {
                         div()
                             .flex()
                             .flex_row()
-                            .text_color(rgb(0xffffff))
+                            .text_color(WHITE)
                             .child("MuzzMan")
                             .text_size(px(32.))
                             .child(div().child("V0").text_size(px(16.)))
@@ -2035,7 +2265,7 @@ impl Render for MuzzManApp {
                     )
                     .child(
                         svg()
-                            .text_color(rgb(0xffffff))
+                            .text_color(WHITE)
                             .path("close")
                             .id("close_button")
                             .min_w(px(32.))
@@ -2061,7 +2291,7 @@ impl Render for MuzzManApp {
                     .track_focus(&self.focus_handle)
                     .child(
                         div()
-                            .text_color(rgb(0xffd43b))
+                            .text_color(gpui::rgb(0xffd43b))
                             .text_size(px(20.))
                             .text_center()
                             .child("Using this application will leak your current IP address!"),
@@ -2073,44 +2303,53 @@ impl Render for MuzzManApp {
                             .items_center()
                             .text_size(px(16.))
                             .child(
-                                div().flex().flex_row().child("Drop files or").child(
-                                    div()
-                                        .left(px(4.0))
-                                        .child("Browse files")
-                                        .text_color(rgb(0x1c7ed6))
-                                        .id("Browse files")
-                                        .cursor(CursorStyle::PointingHand)
-                                        .hover(|s| s.text_color(rgb(0x1971c2)))
-                                        .on_click(cx.listener(|_this, _, _, cx| {
-                                            let prompt = cx.prompt_for_paths(PathPromptOptions {
-                                                files: true,
-                                                directories: cx.can_select_mixed_files_and_dirs(),
-                                                multiple: true,
-                                                prompt: Some("Import files".into()),
-                                            });
-
-                                            cx.spawn(async move |this, cx| {
-                                                let result = prompt.await;
-
-                                                if let Ok(Ok(Some(files))) = result {
-                                                    let this = this.upgrade().unwrap();
-                                                    this.update(cx, move |this, cx| {
-                                                        let files = files
-                                                            .iter()
-                                                            .map(|path| get_files(path))
-                                                            .reduce(|mut acc, e| {
-                                                                acc.extend(e);
-                                                                acc
-                                                            })
-                                                            .unwrap_or_default();
-
-                                                        this.add_files(files, cx);
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .bg(BLACK_2)
+                                    .pl(px(8.))
+                                    .pr(px(8.))
+                                    .child("Drop files or")
+                                    .child(
+                                        div()
+                                            .left(px(4.0))
+                                            .child("Browse files")
+                                            .text_color(UPLOAD)
+                                            .id("Browse files")
+                                            .cursor(CursorStyle::PointingHand)
+                                            .hover(|s| s.text_color(UPLOADING))
+                                            .on_click(cx.listener(|_this, _, _, cx| {
+                                                let prompt =
+                                                    cx.prompt_for_paths(PathPromptOptions {
+                                                        files: true,
+                                                        directories: cx
+                                                            .can_select_mixed_files_and_dirs(),
+                                                        multiple: true,
+                                                        prompt: Some("Import files".into()),
                                                     });
-                                                }
-                                            })
-                                            .detach();
-                                        })),
-                                ),
+
+                                                cx.spawn(async move |this, cx| {
+                                                    let result = prompt.await;
+
+                                                    if let Ok(Ok(Some(files))) = result {
+                                                        let this = this.upgrade().unwrap();
+                                                        this.update(cx, move |this, cx| {
+                                                            let files = files
+                                                                .iter()
+                                                                .map(|path| get_files(path))
+                                                                .reduce(|mut acc, e| {
+                                                                    acc.extend(e);
+                                                                    acc
+                                                                })
+                                                                .unwrap_or_default();
+
+                                                            this.add_files(files, cx);
+                                                        });
+                                                    }
+                                                })
+                                                .detach();
+                                            })),
+                                    ),
                             ),
                     )
                     .child(
@@ -2119,11 +2358,11 @@ impl Render for MuzzManApp {
                             .flex_col()
                             .ml(px(4.))
                             .mr(px(4.))
-                            .bg(rgb(0x212529))
-                            .text_color(rgb(0xffffffff))
+                            .bg(BLACK_2)
+                            .text_color(WHITE)
                             .text_size(px(21.))
                             .child(self.text_input.clone())
-                            .child(div().h(px(2.0)).flex().flex_grow().bg(rgb(0xB1B2B5)))
+                            .child(div().h(px(2.0)).flex().flex_grow().bg(BLACK_5))
                             .child(div().child("Status: Waiting for Files or URL")),
                     ),
             )
@@ -2424,16 +2663,17 @@ fn main() {
         cx.spawn(async move |cx| {
             let (node, blobs) = init.await.unwrap();
 
+
             cx.update(move|cx|{
                 cx.open_window(
                     WindowOptions {
                         window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds::centered(
                             None,
-                            gpui::size(700f32.into(), 300f32.into()),
+                            gpui::size(800f32.into(), 300f32.into()),
                             cx,
                         ))),
                         window_decorations: Some(WindowDecorations::Client),
-                        window_min_size: Some(size(px(700.), px(300.))),
+                        window_min_size: Some(size(px(800.), px(300.))),
                         titlebar: Some(TitlebarOptions{title: Some("MuzzMan".into()), appears_transparent: true, traffic_light_position: None}),
                         window_background: gpui::WindowBackgroundAppearance::Opaque,
                         ..Default::default()
@@ -2450,7 +2690,7 @@ fn main() {
                                 placeholder: SharedString::new(
                                     "Get URL: sendme:blob54686973206973206e6f742061207265616c20636f6c6c656374696f6e",
                                 ),
-                                placeholder_color: rgb(0xadb5bd).into(),
+                                placeholder_color: BLACK_5.into(),
                                 selected_range: 0..0,
                                 selection_reversed: false,
                                 marked_range: None,
