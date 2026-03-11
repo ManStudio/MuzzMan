@@ -15,7 +15,7 @@ use blobsman_graphics::{
         PathPromptOptions, Rgba, ScrollHandle, TitlebarOptions, WindowDecorations, anchored,
         deferred, svg,
     },
-    gpui_tokio,
+    gpui_platform, gpui_tokio,
     iroh::{
         self, EndpointAddr, PublicKey, Watcher,
         endpoint::{ConnectionInfo, PathInfoList},
@@ -2529,7 +2529,7 @@ impl iroh::endpoint::EndpointHooks for IrohHooks {
 }
 
 fn main() {
-    let application = gpui::Application::new().with_assets(Assets {});
+    let application = gpui_platform::application().with_assets(Assets {});
 
     application.run(|cx| {
         gpui_tokio::init(cx);
