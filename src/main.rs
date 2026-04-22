@@ -533,7 +533,7 @@ fn entry_base<E: 'static, T: AsRef<EntryBase<E>> + AsMut<EntryBase<E>> + 'static
     result.when(entry_base.as_ref().show_context_menu, |this| {
         this.child(deferred(
             anchored()
-                .anchor(gpui::Corner::TopLeft)
+                .anchor(gpui::Anchor::TopLeft)
                 .offset(Point {
                     x: entry_base.as_ref().context_menu_offset_x - px(20.),
                     y: px(25.),
@@ -2576,6 +2576,7 @@ fn main() {
                                     let alpn = String::from_utf8(connection_info.alpn().to_vec()).unwrap_or_else(|_|format!("{:?}", connection_info.alpn()));
                                     let mut paths = Vec::default();
                                     for path in connection_info.paths().get(){
+                                        let stats = path.stats().unwrap_or_default();
                                         let info = (match path.remote_addr() {
                                            iroh::TransportAddr::Relay(relay_url) => {
                                                SharedString::new(format!("Alpn: {alpn}, Relay: {}", relay_url))
@@ -2584,7 +2585,7 @@ fn main() {
                                                SharedString::new(format!("Alpn: {alpn}, Ip: {}", socket_addr))
                                            },
                                            _ => {eprintln!("Unknown TransportAddr"); SharedString::new_static("Unknown TransportAddr")},
-                                       },path.stats().rtt, path.stats().udp_rx.bytes, path.stats().udp_tx.bytes);
+                                       },stats.rtt, stats.udp_rx.bytes, stats.udp_tx.bytes);
 
                                        paths.push(info);
                                     }
@@ -2633,7 +2634,7 @@ fn main() {
                 })));
             }
 
-            let endpoint = iroh::Endpoint::builder().hooks(IrohHooks(connections.clone()))
+            let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0).hooks(IrohHooks(connections.clone()))
                 .bind().await.unwrap();
 
             let store = iroh_blobs::store::mem::MemStore::new();

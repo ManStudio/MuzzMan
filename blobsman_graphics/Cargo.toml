@@ -12,10 +12,10 @@ gpui_tokio = { version = "0.1.0", git = "https://github.com/zed-industries/zed"}
 unicode-segmentation = "1.12.0"
 # gpui-component = "0.4.2"
 # eframe = "0.33.2"
-iroh = { version = "0.96.1", features = ["address-lookup-pkarr-dht", "address-lookup-mdns"] }
-iroh-blobs = "0.98.0"
-rand = "0.10.0"
-tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread"] }
+iroh = { version = "0.98.1", features = ["address-lookup-pkarr-dht", "address-lookup-mdns"] }
+iroh-blobs = "0.100.0"
+rand = "0.10.1"
+tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread"] }
 futures-util = "0.3.32"
 
 [target.'cfg(target_os = "linux")'.dependencies]
